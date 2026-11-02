@@ -11,6 +11,7 @@ from pathlib import Path
 from xml.sax.saxutils import escape
 
 import httpx
+
 from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandStart
@@ -35,7 +36,7 @@ from pptx.util import Inches, Pt
 
 from reportlab.lib import colors
 from reportlab.lib.enums import TA_LEFT
-from reportlab.lib.pagesizes import A4, landscape
+from reportlab.lib.pagesizes import landscape, A4
 from reportlab.lib.styles import ParagraphStyle
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
@@ -54,32 +55,29 @@ logging.basicConfig(
 log = logging.getLogger("prezent-ai")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
 
-OPENROUTER_MODEL = os.getenv(
-    "OPENROUTER_MODEL",
-    "openrouter/free"
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+
+GEMINI_MODEL = os.getenv(
+    "GEMINI_MODEL",
+    "gemini-2.5-flash"
 ).strip()
 
-OPENROUTER_URL = (
-    "https://openrouter.ai/api/v1/chat/completions"
-)
-
-APP_URL = (
-    "https://github.com/a88845837-coder/PrezentAI"
+GEMINI_URL = (
+    "https://generativelanguage.googleapis.com/v1beta/"
+    f"models/{GEMINI_MODEL}:generateContent"
 )
 
 MAX_TOPIC_LENGTH = 500
-
 
 if not BOT_TOKEN:
     raise RuntimeError(
         "BOT_TOKEN is missing. Add it in Render Environment."
     )
 
-if not OPENROUTER_API_KEY:
+if not GEMINI_API_KEY:
     raise RuntimeError(
-        "OPENROUTER_API_KEY is missing. Add it in Render Environment."
+        "GEMINI_API_KEY is missing. Add it in Render Environment."
     )
 
 
@@ -87,7 +85,7 @@ bot = Bot(
     token=BOT_TOKEN,
     default=DefaultBotProperties(
         parse_mode=ParseMode.HTML
-    ),
+    )
 )
 
 dp = Dispatcher(
@@ -174,6 +172,7 @@ class PresentationForm(StatesGroup):
 
 # ==================================================
 # ANIMATED PROGRESS
+# Логіка анімації збережена
 # ==================================================
 
 class ProgressAnimator:
@@ -689,7 +688,7 @@ async def design_handler(
 
     try:
 
-        # STAGE 1: AI TEXT
+        # STAGE 1: GEMINI TEXT
 
         progress.set_stage(
             "🧠 AI складає план і готує текст слайдів",
@@ -775,18 +774,17 @@ async def design_handler(
             reply_markup=MAIN_MENU
         )
 
-    except OpenRouterError as exc:
+    except GeminiAPIError as exc:
 
         log.warning(
-            "OpenRouter request failed: %s",
+            "Gemini request failed: %s",
             exc
         )
 
         await progress.finish(
-            "❌ <b>AI не зміг створити текст презентації.</b>\n\n"
+            "❌ <b>Gemini не зміг створити текст презентації.</b>\n\n"
             f"Причина: {html.escape(str(exc))}\n\n"
-            "Перевір ключ OpenRouter, модель та ліміти акаунта, "
-            "а потім спробуй ще раз."
+            "Перевір API-ключ, модель та квоти Google AI Studio."
         )
 
     except Exception:
@@ -801,24 +799,28 @@ async def design_handler(
         await progress.finish(
             "❌ <b>Не вдалося створити презентацію.</b>\n\n"
             f"Код помилки: <code>{error_id}</code>\n"
-            "Надішли цей код і відповідний Traceback із Render Logs."
+            "Перевір Render Logs для цього коду помилки."
         )
 
 
 # ==================================================
-# OPENROUTER AI
+# GEMINI API ERROR
 # ==================================================
 
-class OpenRouterError(Exception):
+class GeminiAPIError(Exception):
     pass
 
+
+# ==================================================
+# JSON PARSER
+# ==================================================
 
 def extract_json(text: str) -> dict:
 
     if not isinstance(text, str) or not text.strip():
 
-        raise OpenRouterError(
-            "AI повернув порожню відповідь. Спробуй ще раз."
+        raise GeminiAPIError(
+            "Gemini повернув порожню відповідь."
         )
 
     cleaned = text.strip()
@@ -841,8 +843,8 @@ def extract_json(text: str) -> dict:
 
     if start < 0 or end <= start:
 
-        raise OpenRouterError(
-            "AI повернув відповідь не у форматі JSON. Спробуй ще раз."
+        raise GeminiAPIError(
+            "Gemini повернув відповідь без JSON."
         )
 
     try:
@@ -853,10 +855,14 @@ def extract_json(text: str) -> dict:
 
     except json.JSONDecodeError as exc:
 
-        raise OpenRouterError(
-            "AI сформував некоректний JSON. Спробуй ще раз."
+        raise GeminiAPIError(
+            "Gemini повернув некоректний JSON."
         ) from exc
 
+
+# ==================================================
+# GEMINI CONTENT GENERATION
+# ==================================================
 
 async def generate_content(data: dict) -> dict:
 
@@ -869,21 +875,19 @@ async def generate_content(data: dict) -> dict:
     )
 
     prompt = f"""
-Створи повноцінну, змістовну презентацію.
+Створи професійну, змістовну презентацію.
 
 Тема: {topic}
-
 Кількість слайдів: рівно {count}
-
 Мова: {language}
 
-Поверни ТІЛЬКИ коректний JSON без Markdown і без пояснень:
+Поверни виключно коректний JSON:
 
 {{
   "title": "Назва презентації",
   "slides": [
     {{
-      "title": "Назва слайда",
+      "title": "Заголовок слайда",
       "content": [
         "Теза 1",
         "Теза 2",
@@ -895,234 +899,432 @@ async def generate_content(data: dict) -> dict:
 }}
 
 Вимоги:
-
 - Рівно {count} слайдів.
-- Логічна структура: титульний, вступ, основна частина, висновки.
-- 3–5 змістовних тез на кожному слайді.
-- Не повторюй однакові тези.
-- Пиши конкретно, зрозуміло, грамотно та без вигаданих статистичних даних.
-- Кожна теза має бути короткою, придатною для слайда.
-- Уникай Markdown, таблиць та емодзі в тексті слайдів.
+- Логічна структура: вступ, основна частина, висновки.
+- 3-5 змістовних тез на кожному слайді.
+- Без повторів.
+- Не вигадуй статистику.
+- Грамотна мова.
+- Короткі тези, придатні для презентації.
+- Не додавай Markdown або пояснення поза JSON.
 """.strip()
 
     headers = {
-
-        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-
-        "Content-Type": "application/json",
-
-        "HTTP-Referer": APP_URL,
-
-        "X-Title": "Prezent AI",
+        "x-goog-api-key": GEMINI_API_KEY,
+        "Content-Type": "application/json"
     }
 
     payload = {
+        "systemInstruction": {
+            "parts": [
+                {
+                    "text": (
+                        "Ти професійний автор навчальних і ділових "
+                        "презентацій. Створюй точний, структурований "
+                        "і грамотний матеріал. Повертай лише JSON."
+                    )
+                }
+            ]
+        },
 
-        "model": OPENROUTER_MODEL,
-
-        "messages": [
-
-            {
-                "role": "system",
-
-                "content": (
-                    "Ти професійний автор навчальних і ділових "
-                    "презентацій. Завжди дотримуйся заданої JSON-структури."
-                )
-            },
-
+        "contents": [
             {
                 "role": "user",
-                "content": prompt
-            },
-
+                "parts": [
+                    {"text": prompt}
+                ]
+            }
         ],
 
-        "temperature": 0.65,
+        "generationConfig": {
+            "temperature": 0.5,
+            "maxOutputTokens": 8192,
+            "responseMimeType": "application/json",
 
-        "max_tokens": 5000,
+            "thinkingConfig": {
+                "thinkingBudget": 0
+            }
+        }
     }
 
-    try:
+    last_error = "Gemini не повернув результат."
 
-        async with httpx.AsyncClient(
-            timeout=httpx.Timeout(
-                180.0,
-                connect=25.0
-            )
-        ) as client:
+    # Two attempts for temporary empty/invalid responses.
 
-            response = await client.post(
-                OPENROUTER_URL,
-                headers=headers,
-                json=payload
-            )
-
-    except httpx.TimeoutException as exc:
-
-        raise OpenRouterError(
-            "Час очікування AI вичерпано. Спробуй ще раз."
-        ) from exc
-
-    except httpx.HTTPError as exc:
-
-        raise OpenRouterError(
-            "Не вдалося підключитися до OpenRouter. "
-            "Перевір мережу та спробуй ще раз."
-        ) from exc
-
-    if response.status_code == 401:
-
-        raise OpenRouterError(
-            "OpenRouter відхилив API-ключ (401). "
-            "Перевір OPENROUTER_API_KEY у Render."
-        )
-
-    if response.status_code == 402:
-
-        raise OpenRouterError(
-            "OpenRouter повідомив про нестачу кредитів "
-            "або ліміт акаунта (402). Перевір Billing/Activity."
-        )
-
-    if response.status_code == 403:
-
-        raise OpenRouterError(
-            "OpenRouter заборонив запит (403). "
-            "Перевір доступ до вибраної моделі."
-        )
-
-    if response.status_code == 429:
-
-        raise OpenRouterError(
-            "Перевищено ліміт OpenRouter (429). "
-            "Зачекай і спробуй ще раз."
-        )
-
-    if response.status_code >= 400:
-
-        detail = ""
+    for attempt in range(1, 3):
 
         try:
 
-            detail = response.json().get(
-                "error", {}
-            ).get("message", "")
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(
+                    180.0,
+                    connect=25.0
+                )
+            ) as client:
 
-        except Exception:
-            pass
+                response = await client.post(
+                    GEMINI_URL,
+                    headers=headers,
+                    json=payload
+                )
 
-        raise OpenRouterError(
-            f"OpenRouter повернув HTTP {response.status_code}. "
-            f"{detail[:220]}"
-        )
+        except httpx.TimeoutException as exc:
 
-    try:
-
-        result = response.json()
-
-        choice = result["choices"][0]
-
-        content = choice["message"]["content"]
-
-        if isinstance(content, list):
-
-            content = "\n".join(
-                part.get("text", "")
-                for part in content
-                if isinstance(part, dict)
+            last_error = (
+                "Час очікування Gemini вичерпано."
             )
 
-        parsed = extract_json(content)
-
-    except OpenRouterError:
-
-        raise
-
-    except (
-        KeyError,
-        IndexError,
-        TypeError,
-        ValueError
-    ) as exc:
-
-        raise OpenRouterError(
-            "OpenRouter повернув неочікувану відповідь. "
-            "Спробуй ще раз."
-        ) from exc
-
-    slides = parsed.get("slides")
-
-    if not isinstance(slides, list) or len(slides) != count:
-
-        actual = (
-            len(slides)
-            if isinstance(slides, list)
-            else 0
-        )
-
-        raise OpenRouterError(
-            f"AI підготував {actual} із {count} потрібних слайдів. "
-            "Спробуй ще раз."
-        )
-
-    normalized = []
-
-    for index, slide in enumerate(slides, start=1):
-
-        if not isinstance(slide, dict):
-
-            raise OpenRouterError(
-                f"AI некоректно сформував слайд {index}."
+            log.warning(
+                "Gemini timeout, attempt=%s",
+                attempt
             )
 
-        title = str(
-            slide.get(
-                "title",
-                f"Слайд {index}"
-            )
-        ).strip()[:180]
+            if attempt == 1:
 
-        points = slide.get(
-            "content",
+                await asyncio.sleep(3)
+                continue
+
+            raise GeminiAPIError(
+                last_error
+            ) from exc
+
+        except httpx.HTTPError as exc:
+
+            log.exception(
+                "Gemini connection error"
+            )
+
+            raise GeminiAPIError(
+                "Не вдалося підключитися до Google Gemini."
+            ) from exc
+
+        try:
+
+            result = response.json()
+
+        except ValueError as exc:
+
+            raise GeminiAPIError(
+                f"Google Gemini повернув некоректну відповідь. "
+                f"HTTP {response.status_code}."
+            ) from exc
+
+        if response.status_code >= 400:
+
+            error = result.get(
+                "error",
+                {}
+            )
+
+            detail = str(
+                error.get(
+                    "message",
+                    "Невідома помилка Google Gemini"
+                )
+            )
+
+            status = response.status_code
+
+            log.error(
+                "Gemini API error: HTTP %s, model=%s, message=%s",
+                status,
+                GEMINI_MODEL,
+                detail[:500]
+            )
+
+            if status == 400:
+
+                raise GeminiAPIError(
+                    "Некоректний запит до Gemini (400). "
+                    + detail[:250]
+                )
+
+            if status in (401, 403):
+
+                raise GeminiAPIError(
+                    "Google не дозволив доступ до API. "
+                    "Перевір GEMINI_API_KEY, проєкт та доступ до моделі. "
+                    + detail[:200]
+                )
+
+            if status == 404:
+
+                raise GeminiAPIError(
+                    f"Модель {GEMINI_MODEL} недоступна. "
+                    "Перевір назву моделі та доступ до неї."
+                )
+
+            if status == 429:
+
+                raise GeminiAPIError(
+                    "Перевищено квоту Gemini. "
+                    "Перевір ліміти Google AI Studio."
+                )
+
+            raise GeminiAPIError(
+                f"Помилка Google Gemini HTTP {status}: "
+                f"{detail[:250]}"
+            )
+
+        if result.get("error"):
+
+            detail = result["error"].get(
+                "message",
+                "Помилка Google Gemini"
+            )
+
+            raise GeminiAPIError(
+                str(detail)[:300]
+            )
+
+        candidates = result.get(
+            "candidates",
             []
         )
 
-        if isinstance(points, str):
-            points = [points]
+        if not candidates:
 
-        if not isinstance(points, list):
-            points = []
+            feedback = result.get(
+                "promptFeedback",
+                {}
+            )
 
-        points = [
-            str(point).strip()[:350]
-            for point in points
-            if str(point).strip()
-        ]
+            block_reason = feedback.get(
+                "blockReason",
+                "невідома причина"
+            )
 
-        if not points:
+            last_error = (
+                "Gemini не повернув відповідь. "
+                f"Причина: {block_reason}."
+            )
+
+            log.warning(
+                "Gemini returned no candidates: %s",
+                last_error
+            )
+
+            if attempt == 1:
+
+                await asyncio.sleep(3)
+                continue
+
+            raise GeminiAPIError(
+                last_error
+            )
+
+        candidate = candidates[0]
+
+        finish_reason = candidate.get(
+            "finishReason",
+            "UNKNOWN"
+        )
+
+        parts = (
+            candidate.get(
+                "content",
+                {}
+            ).get(
+                "parts",
+                []
+            )
+        )
+
+        text_parts = []
+
+        for part in parts:
+
+            if not isinstance(part, dict):
+                continue
+
+            if part.get("thought"):
+                continue
+
+            part_text = part.get("text")
+
+            if (
+                isinstance(part_text, str)
+                and part_text.strip()
+            ):
+
+                text_parts.append(
+                    part_text.strip()
+                )
+
+        content = "\n".join(
+            text_parts
+        ).strip()
+
+        usage = result.get(
+            "usageMetadata",
+            {}
+        )
+
+        log.info(
+            "Gemini response: model=%s finish=%s "
+            "prompt_tokens=%s output_tokens=%s "
+            "thought_tokens=%s chars=%s attempt=%s",
+            GEMINI_MODEL,
+            finish_reason,
+            usage.get("promptTokenCount"),
+            usage.get("candidatesTokenCount"),
+            usage.get("thoughtsTokenCount"),
+            len(content),
+            attempt
+        )
+
+        if finish_reason == "SAFETY":
+
+            raise GeminiAPIError(
+                "Gemini заблокував відповідь фільтром безпеки."
+            )
+
+        if finish_reason == "MAX_TOKENS":
+
+            raise GeminiAPIError(
+                "Gemini вичерпав ліміт вихідних токенів. "
+                "Спробуй створити менше слайдів."
+            )
+
+        if not content:
+
+            last_error = (
+                "Gemini повернув порожню відповідь. "
+                f"Причина завершення: {finish_reason}."
+            )
+
+            log.warning(
+                "Empty Gemini content: %s",
+                last_error
+            )
+
+            if attempt == 1:
+
+                await asyncio.sleep(3)
+                continue
+
+            raise GeminiAPIError(
+                last_error
+            )
+
+        try:
+
+            parsed = extract_json(content)
+
+        except GeminiAPIError as exc:
+
+            last_error = str(exc)
+
+            log.warning(
+                "Gemini JSON parsing error: %s",
+                last_error
+            )
+
+            if attempt == 1:
+
+                await asyncio.sleep(2)
+                continue
+
+            raise
+
+        slides = parsed.get("slides")
+
+        if not isinstance(slides, list):
+
+            raise GeminiAPIError(
+                "У відповіді Gemini немає списку слайдів."
+            )
+
+        if len(slides) != count:
+
+            last_error = (
+                f"Gemini створив {len(slides)} "
+                f"замість {count} слайдів."
+            )
+
+            if attempt == 1:
+
+                await asyncio.sleep(2)
+                continue
+
+            raise GeminiAPIError(
+                last_error
+            )
+
+        normalized = []
+
+        for index, slide in enumerate(
+            slides,
+            start=1
+        ):
+
+            if not isinstance(slide, dict):
+
+                raise GeminiAPIError(
+                    f"Некоректний слайд №{index}."
+                )
+
+            title = str(
+                slide.get(
+                    "title",
+                    f"Слайд {index}"
+                )
+            ).strip()[:180]
+
+            points = slide.get(
+                "content",
+                []
+            )
+
+            if isinstance(points, str):
+                points = [points]
+
+            if not isinstance(points, list):
+                points = []
 
             points = [
-                "Матеріал за темою буде доповнено під час редагування."
+                str(point).strip()[:350]
+                for point in points
+                if str(point).strip()
             ]
 
-        normalized.append({
+            if not points:
 
-            "title": title or f"Слайд {index}",
+                points = [
+                    "Основна інформація за темою презентації."
+                ]
 
-            "content": points[:6],
+            normalized.append({
+                "title": title or f"Слайд {index}",
+                "content": points[:6]
+            })
 
-        })
+        if len(normalized) != count:
 
-    return {
+            raise GeminiAPIError(
+                "Не вдалося обробити всі слайди."
+            )
 
-        "title": str(
-            parsed.get("title", topic)
-        ).strip()[:180],
+        log.info(
+            "Gemini presentation successfully generated: "
+            "slides=%s",
+            count
+        )
 
-        "slides": normalized,
+        return {
+            "title": str(
+                parsed.get(
+                    "title",
+                    topic
+                )
+            ).strip()[:180],
 
-    }
+            "slides": normalized
+        }
+
+    raise GeminiAPIError(
+        last_error
+    )
 
 
 # ==================================================
@@ -1189,7 +1391,9 @@ def add_text(
     paragraph.font.size = Pt(size)
     paragraph.font.bold = bold
 
-    paragraph.font.color.rgb = RGBColor(*color)
+    paragraph.font.color.rgb = RGBColor(
+        *color
+    )
 
     return box
 
@@ -1225,7 +1429,9 @@ def create_pptx(
     prs.slide_width = Inches(13.333)
     prs.slide_height = Inches(7.5)
 
-    for index, item in enumerate(data["slides"]):
+    for index, item in enumerate(
+        data["slides"]
+    ):
 
         slide = prs.slides.add_slide(
             prs.slide_layouts[6]
@@ -1364,7 +1570,7 @@ def create_pptx(
 
             paragraph.level = 0
 
-        # Native PowerPoint Fade transition
+        # Fade transition
 
         add_fade_transition(slide)
 
@@ -1372,19 +1578,15 @@ def create_pptx(
 
 
 # ==================================================
-# PDF FONT
+# UNICODE FONT FOR PDF
 # ==================================================
 
 async def ensure_unicode_font() -> str:
 
     candidates = [
-
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-
         "/usr/share/fonts/dejavu/DejaVuSans.ttf",
-
         "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
-
     ]
 
     for candidate in candidates:
@@ -1398,19 +1600,23 @@ async def ensure_unicode_font() -> str:
         / "PrezentAI-DejaVuSans.ttf"
     )
 
-    if target.exists() and target.stat().st_size > 100_000:
+    if (
+        target.exists()
+        and target.stat().st_size > 100_000
+    ):
 
         return str(target)
 
     font_url = (
         "https://raw.githubusercontent.com/"
-        "prawnpdf/prawn/master/data/fonts/DejaVuSans.ttf"
+        "dejavu-fonts/dejavu-fonts/master/"
+        "ttf/DejaVuSans.ttf"
     )
 
     try:
 
         async with httpx.AsyncClient(
-            timeout=35.0,
+            timeout=40.0,
             follow_redirects=True
         ) as client:
 
@@ -1425,7 +1631,7 @@ async def ensure_unicode_font() -> str:
         ):
 
             raise RuntimeError(
-                "Downloaded font is not a valid TrueType file"
+                "Downloaded font is not a valid TrueType file."
             )
 
         target.write_bytes(
@@ -1437,8 +1643,8 @@ async def ensure_unicode_font() -> str:
     except Exception as exc:
 
         raise RuntimeError(
-            "Не вдалося завантажити шрифт для українського PDF. "
-            "PPTX ще можна створити."
+            "Не вдалося отримати шрифт для українського PDF. "
+            "Перевір доступ Render до GitHub."
         ) from exc
 
 
@@ -1517,7 +1723,9 @@ def create_pdf(
         spaceAfter=13,
     )
 
-    for index, item in enumerate(data["slides"]):
+    for index, item in enumerate(
+        data["slides"]
+    ):
 
         pdf.setFillColor(bg)
 
@@ -1573,14 +1781,12 @@ def create_pdf(
         )
 
         story = [
-
             Paragraph(
                 escape(item["title"]),
                 title_style
             ),
 
             Spacer(1, 14),
-
         ]
 
         for point in item.get(
@@ -1628,22 +1834,19 @@ async def health_handler(
 
     try:
 
-        await reader.read(2048)
+        await asyncio.wait_for(
+            reader.read(2048),
+            timeout=5
+        )
 
         body = b"Prezent AI is running"
 
         response = (
-
             b"HTTP/1.1 200 OK\r\n"
-
             b"Content-Type: text/plain; charset=utf-8\r\n"
-
             + f"Content-Length: {len(body)}\r\n".encode()
-
             + b"Connection: close\r\n\r\n"
-
             + body
-
         )
 
         writer.write(response)
@@ -1691,6 +1894,11 @@ async def main():
 
     log.info(
         "Starting Prezent AI Telegram polling"
+    )
+
+    log.info(
+        "Gemini model: %s",
+        GEMINI_MODEL
     )
 
     try:
