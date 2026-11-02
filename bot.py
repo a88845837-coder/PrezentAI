@@ -1,50 +1,168 @@
 
-import os
-import json
 import asyncio
+import html
+import json
 import logging
+import os
+import re
 import tempfile
+import uuid
 from pathlib import Path
+from xml.sax.saxutils import escape
 
 import httpx
 from aiogram import Bot, Dispatcher, F
-from aiogram.filters import CommandStart
-from aiogram.types import (
-    Message, CallbackQuery, InlineKeyboardMarkup,
-    InlineKeyboardButton, FSInputFile
-)
-from aiogram.fsm.state import State, StatesGroup
+from aiogram.enums import ParseMode
+from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import (
+    CallbackQuery,
+    FSInputFile,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
+from aiogram.client.default import DefaultBotProperties
 
 from pptx import Presentation
-from pptx.util import Inches, Pt
 from pptx.dml.color import RGBColor
+from pptx.enum.shapes import MSO_SHAPE
+from pptx.enum.text import PP_ALIGN
+from pptx.oxml.xmlchemy import OxmlElement
+from pptx.util import Inches, Pt
+
+from reportlab.lib import colors
+from reportlab.lib.enums import TA_LEFT
 from reportlab.lib.pagesizes import A4, landscape
-from reportlab.pdfgen import canvas
+from reportlab.lib.styles import ParagraphStyle
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
+from reportlab.platypus import Frame, Paragraph, Spacer
 
-logging.basicConfig(level=logging.INFO)
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-MODEL = os.getenv("OPENROUTER_MODEL", "openrouter/free")
+# ==================================================
+# CONFIGURATION
+# ==================================================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
+
+log = logging.getLogger("prezent-ai")
+
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
+
+OPENROUTER_MODEL = os.getenv(
+    "OPENROUTER_MODEL",
+    "openrouter/free"
+).strip()
+
+OPENROUTER_URL = (
+    "https://openrouter.ai/api/v1/chat/completions"
+)
+
+APP_URL = (
+    "https://github.com/a88845837-coder/PrezentAI"
+)
+
+MAX_TOPIC_LENGTH = 500
+
 
 if not BOT_TOKEN:
-    raise RuntimeError("Не задано BOT_TOKEN")
+    raise RuntimeError(
+        "BOT_TOKEN is missing. Add it in Render Environment."
+    )
 
 if not OPENROUTER_API_KEY:
-    raise RuntimeError("Не задано OPENROUTER_API_KEY")
+    raise RuntimeError(
+        "OPENROUTER_API_KEY is missing. Add it in Render Environment."
+    )
 
-bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher(storage=MemoryStorage())
 
-MAIN_MENU = InlineKeyboardMarkup(inline_keyboard=[
-    [InlineKeyboardButton(text="🎨 Створити презентацію", callback_data="create")],
-    [InlineKeyboardButton(text="📚 Можливості", callback_data="features")],
-    [InlineKeyboardButton(text="ℹ️ Допомога", callback_data="help")]
-])
+bot = Bot(
+    token=BOT_TOKEN,
+    default=DefaultBotProperties(
+        parse_mode=ParseMode.HTML
+    ),
+)
+
+dp = Dispatcher(
+    storage=MemoryStorage()
+)
+
+
+# ==================================================
+# DESIGNS
+# ==================================================
+
+DESIGNS = {
+    "blue": {
+        "name": "Синій",
+        "bg": (13, 24, 48),
+        "accent": (62, 133, 255),
+        "card": (24, 42, 75),
+    },
+
+    "purple": {
+        "name": "Фіолетовий",
+        "bg": (31, 20, 55),
+        "accent": (164, 108, 255),
+        "card": (52, 37, 82),
+    },
+
+    "dark": {
+        "name": "Темний",
+        "bg": (22, 25, 32),
+        "accent": (65, 194, 205),
+        "card": (42, 47, 58),
+    },
+
+    "light": {
+        "name": "Світлий",
+        "bg": (242, 246, 252),
+        "accent": (50, 105, 195),
+        "card": (226, 234, 246),
+    },
+}
+
+
+LANGUAGES = {
+    "uk": "українською",
+    "en": "англійською",
+    "ru": "російською",
+}
+
+
+# ==================================================
+# KEYBOARDS
+# ==================================================
+
+MAIN_MENU = InlineKeyboardMarkup(
+    inline_keyboard=[
+        [
+            InlineKeyboardButton(
+                text="🎨 Створити презентацію",
+                callback_data="create"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="✨ Можливості",
+                callback_data="features"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="❓ Допомога",
+                callback_data="help"
+            )
+        ],
+    ]
+)
 
 
 class PresentationForm(StatesGroup):
@@ -54,370 +172,1543 @@ class PresentationForm(StatesGroup):
     design = State()
 
 
-def main_text():
-    return (
-        "✨ <b>Prezent AI</b>\n\n"
-        "Твій особистий AI-генератор презентацій!\n\n"
-        "🎨 Створюй красиві презентації за темою.\n"
-        "📊 Отримуй PowerPoint і PDF.\n"
-        "⚡ Економ свій час!"
+# ==================================================
+# ANIMATED PROGRESS
+# ==================================================
+
+class ProgressAnimator:
+
+    FRAMES = (
+        "⏳",
+        "⌛",
+        "🔄",
+        "⚙️",
     )
 
+    def __init__(self, message: Message):
+
+        self.message = message
+
+        self.stage = "Підготовка запиту"
+
+        self.percent = 4
+        self.target = 22
+
+        self.frame = 0
+
+        self.task = None
+        self.lock = asyncio.Lock()
+
+        self.running = False
+
+    def set_stage(self, text: str, target: int):
+
+        self.stage = text
+
+        self.target = max(
+            self.percent,
+            min(98, target)
+        )
+
+    def render(self):
+
+        filled = max(
+            0,
+            min(10, self.percent // 10)
+        )
+
+        bar = (
+            "🟦" * filled
+            + "⬜" * (10 - filled)
+        )
+
+        icon = self.FRAMES[
+            self.frame % len(self.FRAMES)
+        ]
+
+        return (
+            f"{icon} <b>Prezent AI створює презентацію</b>\n\n"
+            f"{self.stage}\n"
+            f"{bar} <b>{self.percent}%</b>\n\n"
+            "<i>Будь ласка, зачекай — це може зайняти кілька хвилин.</i>"
+        )
+
+    async def safe_edit(self):
+
+        try:
+
+            async with self.lock:
+
+                await self.message.edit_text(
+                    self.render()
+                )
+
+        except Exception as exc:
+
+            if "message is not modified" not in str(exc).lower():
+
+                log.debug(
+                    "Progress edit skipped: %s",
+                    exc
+                )
+
+    async def run(self):
+
+        self.running = True
+
+        while self.running:
+
+            self.frame += 1
+
+            if self.percent < self.target:
+
+                self.percent = min(
+                    self.target,
+                    self.percent + 1
+                )
+
+            await self.safe_edit()
+
+            await asyncio.sleep(1.6)
+
+    def start(self):
+
+        self.task = asyncio.create_task(
+            self.run()
+        )
+
+    async def stop(self):
+
+        self.running = False
+
+        if self.task:
+
+            self.task.cancel()
+
+            try:
+                await self.task
+
+            except asyncio.CancelledError:
+                pass
+
+    async def finish(self, text: str):
+
+        await self.stop()
+
+        try:
+
+            await self.message.edit_text(text)
+
+        except Exception:
+
+            log.exception(
+                "Could not update final progress message"
+            )
+
+
+# ==================================================
+# START
+# ==================================================
 
 @dp.message(CommandStart())
-async def start(message: Message, state: FSMContext):
-    await state.clear()
-    await message.answer(main_text(), reply_markup=MAIN_MENU)
+async def start_handler(
+    message: Message,
+    state: FSMContext
+):
 
+    await state.clear()
+
+    await message.answer(
+        "🚀 <b>Prezent AI</b>\n\n"
+
+        "Твій AI-помічник для створення красивих презентацій.\n\n"
+
+        "📊 PowerPoint із переходами між слайдами\n"
+        "📄 PDF для перегляду та друку\n"
+        "🎨 Кілька стилів оформлення\n"
+        "⚡ Анімований процес створення\n\n"
+
+        "Натисни кнопку нижче, щоб почати.",
+
+        reply_markup=MAIN_MENU
+    )
+
+
+@dp.message(Command("cancel"))
+async def cancel_handler(
+    message: Message,
+    state: FSMContext
+):
+
+    await state.clear()
+
+    await message.answer(
+        "Створення скасовано. Можеш почати знову 👇",
+        reply_markup=MAIN_MENU
+    )
+
+
+# ==================================================
+# FEATURES
+# ==================================================
 
 @dp.callback_query(F.data == "features")
-async def features(callback: CallbackQuery):
-    await callback.message.answer(
-        "🌟 <b>Можливості Prezent AI</b>\n\n"
-        "• Створення тексту за темою\n"
-        "• PowerPoint PPTX\n"
-        "• PDF-файл\n"
-        "• Вибір кількості слайдів\n"
-        "• Українська та інші мови\n"
-        "• Кілька стилів оформлення"
-    )
+async def features_handler(
+    callback: CallbackQuery
+):
+
     await callback.answer()
+
+    await callback.message.answer(
+        "✨ <b>Можливості Prezent AI</b>\n\n"
+
+        "• AI-план і текст слайдів\n"
+        "• 6, 8, 10 або 12 слайдів\n"
+        "• Українська, англійська або російська\n"
+        "• Синій, фіолетовий, темний або світлий дизайн\n"
+        "• PPTX із переходом Fade між слайдами\n"
+        "• PDF із підтримкою українських символів\n\n"
+
+        "Примітка: складні анімації окремих об'єктів поки не підтримуються."
+    )
 
 
 @dp.callback_query(F.data == "help")
-async def help_handler(callback: CallbackQuery):
-    await callback.message.answer(
-        "Натисни «Створити презентацію», введи тему "
-        "та вибери параметри. Бот створить файли для тебе."
-    )
+async def help_handler(
+    callback: CallbackQuery
+):
+
     await callback.answer()
 
+    await callback.message.answer(
+        "📝 <b>Як створити презентацію</b>\n\n"
+
+        "1. Натисни «Створити презентацію».\n"
+        "2. Введи тему.\n"
+        "3. Вибери кількість слайдів, мову та дизайн.\n"
+        "4. Дочекайся файлів PPTX і PDF.\n\n"
+
+        "Для скасування використовуй /cancel."
+    )
+
+
+# ==================================================
+# CREATE PRESENTATION
+# ==================================================
 
 @dp.callback_query(F.data == "create")
-async def create_handler(callback: CallbackQuery, state: FSMContext):
-    await state.set_state(PresentationForm.topic)
-    await callback.message.answer(
-        "📝 Напиши тему презентації.\n\n"
-        "Наприклад: Штучний інтелект у сучасному світі"
-    )
+async def create_handler(
+    callback: CallbackQuery,
+    state: FSMContext
+):
+
     await callback.answer()
+
+    await state.clear()
+
+    await state.set_state(
+        PresentationForm.topic
+    )
+
+    await callback.message.answer(
+        "📝 <b>Яка тема презентації?</b>\n\n"
+
+        "Наприклад: «Штучний інтелект у сучасному світі».\n"
+        "Максимум 500 символів."
+    )
 
 
 @dp.message(PresentationForm.topic)
-async def get_topic(message: Message, state: FSMContext):
+async def topic_handler(
+    message: Message,
+    state: FSMContext
+):
+
     topic = (message.text or "").strip()
 
     if len(topic) < 3:
-        await message.answer("Напиши трохи детальнішу тему.")
+
+        await message.answer(
+            "Тема занадто коротка. Напиши хоча б 3 символи."
+        )
+
         return
 
-    if len(topic) > 500:
-        await message.answer("Тема занадто довга. Максимум 500 символів.")
+    if len(topic) > MAX_TOPIC_LENGTH:
+
+        await message.answer(
+            "Тема занадто довга. Максимум 500 символів."
+        )
+
         return
 
-    await state.update_data(topic=topic)
-    await state.set_state(PresentationForm.slides)
-
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="6", callback_data="slides:6"),
-            InlineKeyboardButton(text="8", callback_data="slides:8"),
-            InlineKeyboardButton(text="10", callback_data="slides:10"),
-            InlineKeyboardButton(text="12", callback_data="slides:12")
-        ]
-    ])
-
-    await message.answer("📊 Скільки слайдів потрібно?", reply_markup=keyboard)
-
-
-@dp.callback_query(F.data.startswith("slides:"))
-async def get_slides(callback: CallbackQuery, state: FSMContext):
-    slides = int(callback.data.split(":")[1])
-    await state.update_data(slides=slides)
-    await state.set_state(PresentationForm.language)
-
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="🇺🇦 Українська", callback_data="lang:uk"),
-            InlineKeyboardButton(text="🇬🇧 English", callback_data="lang:en")
-        ],
-        [
-            InlineKeyboardButton(text="🇷🇺 Русский", callback_data="lang:ru")
-        ]
-    ])
-
-    await callback.message.answer("🌍 Обери мову:", reply_markup=keyboard)
-    await callback.answer()
-
-
-@dp.callback_query(F.data.startswith("lang:"))
-async def get_language(callback: CallbackQuery, state: FSMContext):
-    language = callback.data.split(":")[1]
-    await state.update_data(language=language)
-    await state.set_state(PresentationForm.design)
-
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="🔵 Синій", callback_data="design:blue"),
-            InlineKeyboardButton(text="🟣 Фіолетовий", callback_data="design:purple")
-        ],
-        [
-            InlineKeyboardButton(text="⚫ Темний", callback_data="design:dark"),
-            InlineKeyboardButton(text="⚪ Світлий", callback_data="design:light")
-        ]
-    ])
-
-    await callback.message.answer("🎨 Обери дизайн:", reply_markup=keyboard)
-    await callback.answer()
-
-
-@dp.callback_query(F.data.startswith("design:"))
-async def get_design(callback: CallbackQuery, state: FSMContext):
-    design = callback.data.split(":")[1]
-    data = await state.get_data()
-    data["design"] = design
-    await state.clear()
-
-    await callback.answer("Починаю створення!")
-
-    status = await callback.message.answer(
-        "🚀 <b>Prezent AI запускається...</b>\n"
-        "▰▱▱▱▱▱▱▱ 10%"
+    await state.update_data(
+        topic=topic
     )
 
+    await state.set_state(
+        PresentationForm.slides
+    )
+
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="6",
+                    callback_data="slides:6"
+                ),
+
+                InlineKeyboardButton(
+                    text="8",
+                    callback_data="slides:8"
+                ),
+
+                InlineKeyboardButton(
+                    text="10",
+                    callback_data="slides:10"
+                ),
+
+                InlineKeyboardButton(
+                    text="12",
+                    callback_data="slides:12"
+                ),
+            ]
+        ]
+    )
+
+    await message.answer(
+        "📊 <b>Скільки слайдів потрібно?</b>",
+        reply_markup=keyboard
+    )
+
+
+# ==================================================
+# SELECT SLIDES
+# ==================================================
+
+@dp.callback_query(F.data.startswith("slides:"))
+async def slides_handler(
+    callback: CallbackQuery,
+    state: FSMContext
+):
+
+    if await state.get_state() != PresentationForm.slides.state:
+
+        await callback.answer(
+            "Почни створення через меню.",
+            show_alert=True
+        )
+
+        return
+
     try:
-        presentation_data = await generate_content(data, status)
-        with tempfile.TemporaryDirectory() as temp_dir:
-            pptx_path = str(Path(temp_dir) / "PrezentAI.pptx")
-            pdf_path = str(Path(temp_dir) / "PrezentAI.pdf")
 
-            create_pptx(presentation_data, data["design"], pptx_path)
-            create_pdf(presentation_data, pdf_path)
+        count = int(
+            callback.data.split(":", 1)[1]
+        )
 
-            await status.edit_text("✨ <b>Презентація готова!</b>")
+    except (ValueError, IndexError):
+
+        await callback.answer(
+            "Неправильна кількість слайдів.",
+            show_alert=True
+        )
+
+        return
+
+    if count not in (6, 8, 10, 12):
+
+        await callback.answer(
+            "Обери варіант із кнопок.",
+            show_alert=True
+        )
+
+        return
+
+    await state.update_data(
+        slides=count
+    )
+
+    await state.set_state(
+        PresentationForm.language
+    )
+
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🇺🇦 Українська",
+                    callback_data="lang:uk"
+                ),
+
+                InlineKeyboardButton(
+                    text="🇬🇧 English",
+                    callback_data="lang:en"
+                ),
+            ],
+
+            [
+                InlineKeyboardButton(
+                    text="🇷🇺 Русский",
+                    callback_data="lang:ru"
+                ),
+            ]
+        ]
+    )
+
+    await callback.message.answer(
+        "🌍 <b>Обери мову презентації:</b>",
+        reply_markup=keyboard
+    )
+
+    await callback.answer()
+
+
+# ==================================================
+# SELECT LANGUAGE
+# ==================================================
+
+@dp.callback_query(F.data.startswith("lang:"))
+async def language_handler(
+    callback: CallbackQuery,
+    state: FSMContext
+):
+
+    if await state.get_state() != PresentationForm.language.state:
+
+        await callback.answer(
+            "Почни створення через меню.",
+            show_alert=True
+        )
+
+        return
+
+    language = callback.data.split(":", 1)[1]
+
+    if language not in LANGUAGES:
+
+        await callback.answer(
+            "Непідтримувана мова.",
+            show_alert=True
+        )
+
+        return
+
+    await state.update_data(
+        language=language
+    )
+
+    await state.set_state(
+        PresentationForm.design
+    )
+
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🔵 Синій",
+                    callback_data="design:blue"
+                ),
+
+                InlineKeyboardButton(
+                    text="🟣 Фіолетовий",
+                    callback_data="design:purple"
+                ),
+            ],
+
+            [
+                InlineKeyboardButton(
+                    text="⚫ Темний",
+                    callback_data="design:dark"
+                ),
+
+                InlineKeyboardButton(
+                    text="⚪ Світлий",
+                    callback_data="design:light"
+                ),
+            ]
+        ]
+    )
+
+    await callback.message.answer(
+        "🎨 <b>Обери дизайн:</b>",
+        reply_markup=keyboard
+    )
+
+    await callback.answer()
+
+
+# ==================================================
+# SELECT DESIGN + GENERATION
+# ==================================================
+
+@dp.callback_query(F.data.startswith("design:"))
+async def design_handler(
+    callback: CallbackQuery,
+    state: FSMContext
+):
+
+    if await state.get_state() != PresentationForm.design.state:
+
+        await callback.answer(
+            "Почни створення через меню.",
+            show_alert=True
+        )
+
+        return
+
+    design = callback.data.split(":", 1)[1]
+
+    if design not in DESIGNS:
+
+        await callback.answer(
+            "Непідтримуваний дизайн.",
+            show_alert=True
+        )
+
+        return
+
+    data = await state.get_data()
+
+    data["design"] = design
+
+    await state.clear()
+
+    await callback.answer(
+        "Починаю створення!"
+    )
+
+    status = await callback.message.answer(
+        "⏳ <b>Prezent AI запускається...</b>\n\n"
+        "🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜ 4%"
+    )
+
+    progress = ProgressAnimator(status)
+
+    progress.start()
+
+    try:
+
+        # STAGE 1: AI TEXT
+
+        progress.set_stage(
+            "🧠 AI складає план і готує текст слайдів",
+            62
+        )
+
+        presentation_data = await generate_content(data)
+
+        # STAGE 2: POWERPOINT
+
+        progress.set_stage(
+            "🎨 Оформлюю слайди та додаю переходи",
+            82
+        )
+
+        with tempfile.TemporaryDirectory(
+            prefix="prezent_ai_"
+        ) as tmp:
+
+            pptx_path = str(
+                Path(tmp) / "PrezentAI.pptx"
+            )
+
+            pdf_path = str(
+                Path(tmp) / "PrezentAI.pdf"
+            )
+
+            await asyncio.to_thread(
+                create_pptx,
+                presentation_data,
+                design,
+                pptx_path
+            )
+
+            # STAGE 3: PDF
+
+            progress.set_stage(
+                "📄 Готую PDF-файл",
+                94
+            )
+
+            font_path = await ensure_unicode_font()
+
+            await asyncio.to_thread(
+                create_pdf,
+                presentation_data,
+                design,
+                pdf_path,
+                font_path
+            )
+
+            # FINISH
+
+            await progress.finish(
+                "✅ <b>Презентація готова!</b>\n\n"
+                "📤 Надсилаю файли..."
+            )
 
             await callback.message.answer_document(
-                FSInputFile(pptx_path),
-                caption="📊 Твоя презентація PowerPoint"
-            )
-            await callback.message.answer_document(
-                FSInputFile(pdf_path),
-                caption="📄 Версія PDF"
+                FSInputFile(
+                    pptx_path,
+                    filename="PrezentAI.pptx"
+                ),
+
+                caption=(
+                    "📊 <b>PowerPoint</b> — презентація з переходами Fade."
+                )
             )
 
-    except Exception as error:
-        logging.exception("Presentation generation failed")
-        await status.edit_text(
-            "❌ Не вдалося створити презентацію.\n"
-            "Спробуй ще раз трохи пізніше."
+            await callback.message.answer_document(
+                FSInputFile(
+                    pdf_path,
+                    filename="PrezentAI.pdf"
+                ),
+
+                caption=(
+                    "📄 <b>PDF</b> — версія для перегляду та друку."
+                )
+            )
+
+        await callback.message.answer(
+            "Що створимо наступного разу? 👇",
+            reply_markup=MAIN_MENU
+        )
+
+    except OpenRouterError as exc:
+
+        log.warning(
+            "OpenRouter request failed: %s",
+            exc
+        )
+
+        await progress.finish(
+            "❌ <b>AI не зміг створити текст презентації.</b>\n\n"
+            f"Причина: {html.escape(str(exc))}\n\n"
+            "Перевір ключ OpenRouter, модель та ліміти акаунта, "
+            "а потім спробуй ще раз."
+        )
+
+    except Exception:
+
+        error_id = uuid.uuid4().hex[:8].upper()
+
+        log.exception(
+            "Presentation generation failed; error_id=%s",
+            error_id
+        )
+
+        await progress.finish(
+            "❌ <b>Не вдалося створити презентацію.</b>\n\n"
+            f"Код помилки: <code>{error_id}</code>\n"
+            "Надішли цей код і відповідний Traceback із Render Logs."
         )
 
 
-async def generate_content(data, status):
-    language_names = {
-        "uk": "Ukrainian",
-        "en": "English",
-        "ru": "Russian"
-    }
+# ==================================================
+# OPENROUTER AI
+# ==================================================
+
+class OpenRouterError(Exception):
+    pass
+
+
+def extract_json(text: str) -> dict:
+
+    if not isinstance(text, str) or not text.strip():
+
+        raise OpenRouterError(
+            "AI повернув порожню відповідь. Спробуй ще раз."
+        )
+
+    cleaned = text.strip()
+
+    cleaned = re.sub(
+        r"^```(?:json)?\s*",
+        "",
+        cleaned,
+        flags=re.IGNORECASE
+    )
+
+    cleaned = re.sub(
+        r"\s*```$",
+        "",
+        cleaned
+    )
+
+    start = cleaned.find("{")
+    end = cleaned.rfind("}")
+
+    if start < 0 or end <= start:
+
+        raise OpenRouterError(
+            "AI повернув відповідь не у форматі JSON. Спробуй ще раз."
+        )
+
+    try:
+
+        return json.loads(
+            cleaned[start:end + 1]
+        )
+
+    except json.JSONDecodeError as exc:
+
+        raise OpenRouterError(
+            "AI сформував некоректний JSON. Спробуй ще раз."
+        ) from exc
+
+
+async def generate_content(data: dict) -> dict:
+
+    topic = data["topic"]
+    count = data["slides"]
+
+    language = LANGUAGES.get(
+        data["language"],
+        "українською"
+    )
 
     prompt = f"""
-Create a detailed presentation in JSON.
+Створи повноцінну, змістовну презентацію.
 
-Topic: {data['topic']}
-Number of slides: {data['slides']}
-Language: {language_names.get(data['language'], 'Ukrainian')}
+Тема: {topic}
 
-Return ONLY valid JSON in this exact format:
+Кількість слайдів: рівно {count}
+
+Мова: {language}
+
+Поверни ТІЛЬКИ коректний JSON без Markdown і без пояснень:
+
 {{
-  "title": "Presentation title",
+  "title": "Назва презентації",
   "slides": [
     {{
-      "title": "Slide title",
-      "content": ["Point 1", "Point 2", "Point 3"],
-      "notes": "Short explanation"
+      "title": "Назва слайда",
+      "content": [
+        "Теза 1",
+        "Теза 2",
+        "Теза 3",
+        "Теза 4"
+      ]
     }}
   ]
 }}
 
-Requirements:
-- Exactly {data['slides']} slides.
-- Educational, accurate and detailed.
-- Logical structure: introduction, main content, conclusion.
-- Avoid repeating information.
-- Each slide should have 3-5 concise points.
-- Do not use Markdown.
-"""
+Вимоги:
 
-    await status.edit_text("🧠 <b>AI створює матеріал...</b>\n▰▰▱▱▱▱▱▱ 25%")
+- Рівно {count} слайдів.
+- Логічна структура: титульний, вступ, основна частина, висновки.
+- 3–5 змістовних тез на кожному слайді.
+- Не повторюй однакові тези.
+- Пиши конкретно, зрозуміло, грамотно та без вигаданих статистичних даних.
+- Кожна теза має бути короткою, придатною для слайда.
+- Уникай Markdown, таблиць та емодзі в тексті слайдів.
+""".strip()
 
     headers = {
+
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+
         "Content-Type": "application/json",
-        "HTTP-Referer": "https://github.com/a88845837-coder/PrezentAI",
-        "X-Title": "Prezent AI"
+
+        "HTTP-Referer": APP_URL,
+
+        "X-Title": "Prezent AI",
     }
 
     payload = {
-        "model": MODEL,
+
+        "model": OPENROUTER_MODEL,
+
         "messages": [
+
             {
                 "role": "system",
-                "content": "You create accurate, structured presentations."
+
+                "content": (
+                    "Ти професійний автор навчальних і ділових "
+                    "презентацій. Завжди дотримуйся заданої JSON-структури."
+                )
             },
-            {"role": "user", "content": prompt}
+
+            {
+                "role": "user",
+                "content": prompt
+            },
+
         ],
-        "temperature": 0.7
+
+        "temperature": 0.65,
+
+        "max_tokens": 5000,
     }
 
-    async with httpx.AsyncClient(timeout=180) as client:
-        response = await client.post(
-            "https://openrouter.ai/api/v1/chat/completions",
-            headers=headers,
-            json=payload
+    try:
+
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(
+                180.0,
+                connect=25.0
+            )
+        ) as client:
+
+            response = await client.post(
+                OPENROUTER_URL,
+                headers=headers,
+                json=payload
+            )
+
+    except httpx.TimeoutException as exc:
+
+        raise OpenRouterError(
+            "Час очікування AI вичерпано. Спробуй ще раз."
+        ) from exc
+
+    except httpx.HTTPError as exc:
+
+        raise OpenRouterError(
+            "Не вдалося підключитися до OpenRouter. "
+            "Перевір мережу та спробуй ще раз."
+        ) from exc
+
+    if response.status_code == 401:
+
+        raise OpenRouterError(
+            "OpenRouter відхилив API-ключ (401). "
+            "Перевір OPENROUTER_API_KEY у Render."
         )
-        response.raise_for_status()
+
+    if response.status_code == 402:
+
+        raise OpenRouterError(
+            "OpenRouter повідомив про нестачу кредитів "
+            "або ліміт акаунта (402). Перевір Billing/Activity."
+        )
+
+    if response.status_code == 403:
+
+        raise OpenRouterError(
+            "OpenRouter заборонив запит (403). "
+            "Перевір доступ до вибраної моделі."
+        )
+
+    if response.status_code == 429:
+
+        raise OpenRouterError(
+            "Перевищено ліміт OpenRouter (429). "
+            "Зачекай і спробуй ще раз."
+        )
+
+    if response.status_code >= 400:
+
+        detail = ""
+
+        try:
+
+            detail = response.json().get(
+                "error", {}
+            ).get("message", "")
+
+        except Exception:
+            pass
+
+        raise OpenRouterError(
+            f"OpenRouter повернув HTTP {response.status_code}. "
+            f"{detail[:220]}"
+        )
+
+    try:
+
         result = response.json()
 
-    raw = result["choices"][0]["message"]["content"]
-    raw = raw.strip()
+        choice = result["choices"][0]
 
-    if raw.startswith("```"):
-        raw = raw.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+        content = choice["message"]["content"]
 
-    parsed = json.loads(raw)
+        if isinstance(content, list):
 
-    if len(parsed.get("slides", [])) != data["slides"]:
-        raise ValueError("AI returned an incorrect number of slides")
+            content = "\n".join(
+                part.get("text", "")
+                for part in content
+                if isinstance(part, dict)
+            )
 
-    await status.edit_text("🎨 <b>Створюю дизайн слайдів...</b>\n▰▰▰▰▱▱▱▱ 55%")
+        parsed = extract_json(content)
 
-    return parsed
+    except OpenRouterError:
+
+        raise
+
+    except (
+        KeyError,
+        IndexError,
+        TypeError,
+        ValueError
+    ) as exc:
+
+        raise OpenRouterError(
+            "OpenRouter повернув неочікувану відповідь. "
+            "Спробуй ще раз."
+        ) from exc
+
+    slides = parsed.get("slides")
+
+    if not isinstance(slides, list) or len(slides) != count:
+
+        actual = (
+            len(slides)
+            if isinstance(slides, list)
+            else 0
+        )
+
+        raise OpenRouterError(
+            f"AI підготував {actual} із {count} потрібних слайдів. "
+            "Спробуй ще раз."
+        )
+
+    normalized = []
+
+    for index, slide in enumerate(slides, start=1):
+
+        if not isinstance(slide, dict):
+
+            raise OpenRouterError(
+                f"AI некоректно сформував слайд {index}."
+            )
+
+        title = str(
+            slide.get(
+                "title",
+                f"Слайд {index}"
+            )
+        ).strip()[:180]
+
+        points = slide.get(
+            "content",
+            []
+        )
+
+        if isinstance(points, str):
+            points = [points]
+
+        if not isinstance(points, list):
+            points = []
+
+        points = [
+            str(point).strip()[:350]
+            for point in points
+            if str(point).strip()
+        ]
+
+        if not points:
+
+            points = [
+                "Матеріал за темою буде доповнено під час редагування."
+            ]
+
+        normalized.append({
+
+            "title": title or f"Слайд {index}",
+
+            "content": points[:6],
+
+        })
+
+    return {
+
+        "title": str(
+            parsed.get("title", topic)
+        ).strip()[:180],
+
+        "slides": normalized,
+
+    }
 
 
-def create_pptx(data, design, output):
+# ==================================================
+# POWERPOINT
+# ==================================================
+
+def add_fade_transition(slide):
+
+    transition = OxmlElement(
+        "p:transition"
+    )
+
+    transition.set(
+        "spd",
+        "med"
+    )
+
+    transition.append(
+        OxmlElement("p:fade")
+    )
+
+    slide._element.insert(
+        2,
+        transition
+    )
+
+
+def add_text(
+    slide,
+    text,
+    x,
+    y,
+    w,
+    h,
+    size,
+    color,
+    bold=False,
+    align=PP_ALIGN.LEFT
+):
+
+    box = slide.shapes.add_textbox(
+        Inches(x),
+        Inches(y),
+        Inches(w),
+        Inches(h)
+    )
+
+    frame = box.text_frame
+
+    frame.clear()
+    frame.word_wrap = True
+
+    frame.margin_left = Inches(0.03)
+    frame.margin_right = Inches(0.03)
+    frame.margin_top = Inches(0.02)
+    frame.margin_bottom = Inches(0.02)
+
+    paragraph = frame.paragraphs[0]
+
+    paragraph.text = str(text)
+    paragraph.alignment = align
+
+    paragraph.font.name = "Aptos"
+    paragraph.font.size = Pt(size)
+    paragraph.font.bold = bold
+
+    paragraph.font.color.rgb = RGBColor(*color)
+
+    return box
+
+
+def create_pptx(
+    data: dict,
+    design: str,
+    output_path: str
+):
+
+    theme = DESIGNS[design]
+
+    bg = theme["bg"]
+    accent = theme["accent"]
+    card = theme["card"]
+
+    is_light = design == "light"
+
+    title_color = (
+        (24, 35, 55)
+        if is_light
+        else (255, 255, 255)
+    )
+
+    body_color = (
+        (52, 64, 82)
+        if is_light
+        else (228, 235, 248)
+    )
+
     prs = Presentation()
+
     prs.slide_width = Inches(13.333)
     prs.slide_height = Inches(7.5)
 
-    themes = {
-        "blue": ((15, 30, 65), (65, 130, 255)),
-        "purple": ((35, 20, 65), (160, 100, 255)),
-        "dark": ((25, 27, 32), (100, 190, 220)),
-        "light": ((245, 247, 252), (55, 105, 190))
-    }
-
-    bg, accent = themes.get(design, themes["blue"])
-    light = design == "light"
-
     for index, item in enumerate(data["slides"]):
-        slide = prs.slides.add_slide(prs.slide_layouts[6])
+
+        slide = prs.slides.add_slide(
+            prs.slide_layouts[6]
+        )
+
         slide.background.fill.solid()
-        slide.background.fill.fore_color.rgb = RGBColor(*bg)
 
-        # Decorative accent bar
-        bar = slide.shapes.add_shape(
-            1, Inches(0), Inches(0), Inches(0.16), Inches(7.5)
+        slide.background.fill.fore_color.rgb = (
+            RGBColor(*bg)
         )
-        bar.fill.solid()
-        bar.fill.fore_color.rgb = RGBColor(*accent)
-        bar.line.fill.background()
 
-        title_box = slide.shapes.add_textbox(
-            Inches(0.8), Inches(0.65), Inches(11.5), Inches(1.2)
+        # Accent rail
+
+        rail = slide.shapes.add_shape(
+            MSO_SHAPE.RECTANGLE,
+            0,
+            0,
+            Inches(0.16),
+            Inches(7.5)
         )
-        tf = title_box.text_frame
+
+        rail.fill.solid()
+
+        rail.fill.fore_color.rgb = RGBColor(
+            *accent
+        )
+
+        rail.line.fill.background()
+
+        # Header
+
+        add_text(
+            slide,
+            "PREZENT AI  /  PRESENTATION",
+            0.75,
+            0.38,
+            6.0,
+            0.3,
+            10,
+            accent,
+            True
+        )
+
+        add_text(
+            slide,
+            f"{index + 1:02d}  /  {len(data['slides']):02d}",
+            11.35,
+            0.38,
+            1.1,
+            0.3,
+            10,
+            accent,
+            True,
+            PP_ALIGN.RIGHT
+        )
+
+        # Title
+
+        add_text(
+            slide,
+            item["title"],
+            0.78,
+            0.92,
+            11.7,
+            1.15,
+            30,
+            title_color,
+            True
+        )
+
+        # Main card
+
+        card_shape = slide.shapes.add_shape(
+            MSO_SHAPE.ROUNDED_RECTANGLE,
+            Inches(0.78),
+            Inches(2.25),
+            Inches(11.75),
+            Inches(4.45)
+        )
+
+        card_shape.fill.solid()
+
+        card_shape.fill.fore_color.rgb = RGBColor(
+            *card
+        )
+
+        card_shape.line.color.rgb = RGBColor(
+            *accent
+        )
+
+        # Text inside card
+
+        text_box = slide.shapes.add_textbox(
+            Inches(1.18),
+            Inches(2.58),
+            Inches(10.95),
+            Inches(3.82)
+        )
+
+        tf = text_box.text_frame
+
+        tf.clear()
         tf.word_wrap = True
-        p = tf.paragraphs[0]
-        p.text = item.get("title", "Slide")
-        p.font.size = Pt(30)
-        p.font.bold = True
-        p.font.color.rgb = RGBColor(
-            (25, 35, 55) if light else (255, 255, 255)
-        )
 
-        content_box = slide.shapes.add_textbox(
-            Inches(1.0), Inches(2.0), Inches(11.2), Inches(4.4)
-        )
-        tf = content_box.text_frame
-        tf.word_wrap = True
+        tf.margin_left = Inches(0.03)
+        tf.margin_right = Inches(0.03)
+        tf.margin_top = Inches(0.03)
+        tf.margin_bottom = Inches(0.02)
 
-        for i, point in enumerate(item.get("content", [])):
-            p = tf.paragraphs[0] if i == 0 else tf.add_paragraph()
-            p.text = "• " + str(point)
-            p.font.size = Pt(21)
-            p.font.color.rgb = RGBColor(
-                (40, 50, 70) if light else (230, 235, 250)
+        points = item.get(
+            "content",
+            []
+        )[:6]
+
+        for p_index, point in enumerate(points):
+
+            paragraph = (
+                tf.paragraphs[0]
+                if p_index == 0
+                else tf.add_paragraph()
             )
-            p.space_after = Pt(18)
 
-        footer = slide.shapes.add_textbox(
-            Inches(10.7), Inches(7.0), Inches(2), Inches(0.3)
+            paragraph.text = "•  " + str(point)
+
+            paragraph.font.name = "Aptos"
+
+            paragraph.font.size = Pt(
+                20 if len(points) <= 4 else 17
+            )
+
+            paragraph.font.color.rgb = RGBColor(
+                *body_color
+            )
+
+            paragraph.space_after = Pt(15)
+
+            paragraph.level = 0
+
+        # Native PowerPoint Fade transition
+
+        add_fade_transition(slide)
+
+    prs.save(output_path)
+
+
+# ==================================================
+# PDF FONT
+# ==================================================
+
+async def ensure_unicode_font() -> str:
+
+    candidates = [
+
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+
+        "/usr/share/fonts/dejavu/DejaVuSans.ttf",
+
+        "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
+
+    ]
+
+    for candidate in candidates:
+
+        if Path(candidate).exists():
+
+            return candidate
+
+    target = (
+        Path(tempfile.gettempdir())
+        / "PrezentAI-DejaVuSans.ttf"
+    )
+
+    if target.exists() and target.stat().st_size > 100_000:
+
+        return str(target)
+
+    font_url = (
+        "https://raw.githubusercontent.com/"
+        "prawnpdf/prawn/master/data/fonts/DejaVuSans.ttf"
+    )
+
+    try:
+
+        async with httpx.AsyncClient(
+            timeout=35.0,
+            follow_redirects=True
+        ) as client:
+
+            response = await client.get(
+                font_url
+            )
+
+            response.raise_for_status()
+
+        if not response.content.startswith(
+            b"\x00\x01\x00\x00"
+        ):
+
+            raise RuntimeError(
+                "Downloaded font is not a valid TrueType file"
+            )
+
+        target.write_bytes(
+            response.content
         )
-        p = footer.text_frame.paragraphs[0]
-        p.text = f"PREZENT AI  •  {index + 1}/{len(data['slides'])}"
-        p.font.size = Pt(9)
-        p.font.color.rgb = RGBColor(*accent)
 
-    prs.save(output)
+        return str(target)
+
+    except Exception as exc:
+
+        raise RuntimeError(
+            "Не вдалося завантажити шрифт для українського PDF. "
+            "PPTX ще можна створити."
+        ) from exc
 
 
-def create_pdf(data, output):
-    pdf = canvas.Canvas(output, pagesize=landscape(A4))
-    width, height = landscape(A4)
+# ==================================================
+# PDF GENERATOR
+# ==================================================
 
-    font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
-    bold_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+def create_pdf(
+    data: dict,
+    design: str,
+    output_path: str,
+    font_path: str
+):
 
-    if os.path.exists(font_path):
-        pdfmetrics.registerFont(TTFont("DejaVu", font_path))
-        pdfmetrics.registerFont(TTFont("DejaVuBold", bold_path))
-        regular_font = "DejaVu"
-        bold_font = "DejaVuBold"
-    else:
-        regular_font = "Helvetica"
-        bold_font = "Helvetica-Bold"
+    theme = DESIGNS[design]
+
+    bg = colors.HexColor(
+        "#%02x%02x%02x" % theme["bg"]
+    )
+
+    accent = colors.HexColor(
+        "#%02x%02x%02x" % theme["accent"]
+    )
+
+    card = colors.HexColor(
+        "#%02x%02x%02x" % theme["card"]
+    )
+
+    is_light = design == "light"
+
+    title_color = (
+        colors.HexColor("#182337")
+        if is_light
+        else colors.white
+    )
+
+    body_color = (
+        colors.HexColor("#344052")
+        if is_light
+        else colors.HexColor("#e4ebf8")
+    )
+
+    pdfmetrics.registerFont(
+        TTFont(
+            "PrezentSans",
+            font_path
+        )
+    )
+
+    page_size = landscape(A4)
+
+    page_w, page_h = page_size
+
+    pdf = canvas.Canvas(
+        output_path,
+        pagesize=page_size
+    )
+
+    title_style = ParagraphStyle(
+        "SlideTitle",
+        fontName="PrezentSans",
+        fontSize=23,
+        leading=29,
+        textColor=title_color,
+        alignment=TA_LEFT,
+        spaceAfter=8,
+    )
+
+    body_style = ParagraphStyle(
+        "SlideBody",
+        fontName="PrezentSans",
+        fontSize=15,
+        leading=22,
+        textColor=body_color,
+        alignment=TA_LEFT,
+        spaceAfter=13,
+    )
 
     for index, item in enumerate(data["slides"]):
-        pdf.setFillColorRGB(0.06, 0.12, 0.25)
-        pdf.rect(0, 0, width, height, fill=1, stroke=0)
 
-        pdf.setFillColorRGB(0.3, 0.55, 1)
-        pdf.rect(0, 0, 12, height, fill=1, stroke=0)
+        pdf.setFillColor(bg)
 
-        pdf.setFillColorRGB(1, 1, 1)
-        pdf.setFont(bold_font, 25)
-        pdf.drawString(55, height - 75, str(item.get("title", ""))[:90])
+        pdf.rect(
+            0,
+            0,
+            page_w,
+            page_h,
+            fill=1,
+            stroke=0
+        )
 
-        y = height - 140
-        pdf.setFont(regular_font, 16)
+        pdf.setFillColor(accent)
 
-        for point in item.get("content", []):
-            text = "• " + str(point)
-            words = text.split()
-            line = ""
+        pdf.rect(
+            0,
+            0,
+            12,
+            page_h,
+            fill=1,
+            stroke=0
+        )
 
-            for word in words:
-                if pdf.stringWidth(line + " " + word, regular_font, 16) > width - 120:
-                    pdf.drawString(65, y, line)
-                    y -= 25
-                    line = word
-                else:
-                    line = (line + " " + word).strip()
+        pdf.setFillColor(accent)
 
-            if line:
-                pdf.drawString(65, y, line)
-                y -= 35
+        pdf.setFont(
+            "PrezentSans",
+            8
+        )
 
-        pdf.setFont(regular_font, 9)
-        pdf.drawRightString(width - 35, 20, f"PREZENT AI • {index + 1}/{len(data['slides'])}")
+        pdf.drawString(
+            45,
+            page_h - 30,
+            "PREZENT AI  /  PRESENTATION"
+        )
+
+        pdf.drawRightString(
+            page_w - 38,
+            page_h - 30,
+            f"{index + 1:02d} / {len(data['slides']):02d}"
+        )
+
+        pdf.setFillColor(card)
+
+        pdf.roundRect(
+            42,
+            55,
+            page_w - 84,
+            page_h - 112,
+            12,
+            fill=1,
+            stroke=0
+        )
+
+        story = [
+
+            Paragraph(
+                escape(item["title"]),
+                title_style
+            ),
+
+            Spacer(1, 14),
+
+        ]
+
+        for point in item.get(
+            "content",
+            []
+        )[:6]:
+
+            story.append(
+                Paragraph(
+                    "•  " + escape(str(point)),
+                    body_style
+                )
+            )
+
+        frame = Frame(
+            65,
+            78,
+            page_w - 130,
+            page_h - 180,
+            leftPadding=0,
+            rightPadding=0,
+            topPadding=0,
+            bottomPadding=0,
+            showBoundary=0
+        )
+
+        frame.addFromList(
+            story,
+            pdf
+        )
+
         pdf.showPage()
 
     pdf.save()
 
 
+# ==================================================
+# RENDER HTTP HEALTH SERVER
+# ==================================================
+
+async def health_handler(
+    reader: asyncio.StreamReader,
+    writer: asyncio.StreamWriter
+):
+
+    try:
+
+        await reader.read(2048)
+
+        body = b"Prezent AI is running"
+
+        response = (
+
+            b"HTTP/1.1 200 OK\r\n"
+
+            b"Content-Type: text/plain; charset=utf-8\r\n"
+
+            + f"Content-Length: {len(body)}\r\n".encode()
+
+            + b"Connection: close\r\n\r\n"
+
+            + body
+
+        )
+
+        writer.write(response)
+
+        await writer.drain()
+
+    except Exception:
+
+        log.exception(
+            "Health endpoint error"
+        )
+
+    finally:
+
+        writer.close()
+
+        try:
+
+            await writer.wait_closed()
+
+        except Exception:
+            pass
+
+
+# ==================================================
+# MAIN
+# ==================================================
+
 async def main():
-    await dp.start_polling(bot)
+
+    port = int(
+        os.getenv("PORT", "10000")
+    )
+
+    server = await asyncio.start_server(
+        health_handler,
+        "0.0.0.0",
+        port
+    )
+
+    log.info(
+        "HTTP health server listening on port %s",
+        port
+    )
+
+    log.info(
+        "Starting Prezent AI Telegram polling"
+    )
+
+    try:
+
+        async with server:
+
+            await dp.start_polling(bot)
+
+    finally:
+
+        server.close()
+
+        await server.wait_closed()
+
+        await bot.session.close()
 
 
 if __name__ == "__main__":
+
     asyncio.run(main())
+
