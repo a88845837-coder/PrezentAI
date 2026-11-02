@@ -36,16 +36,16 @@ from pptx.util import Inches, Pt
 
 from reportlab.lib import colors
 from reportlab.lib.enums import TA_LEFT
-from reportlab.lib.pagesizes import landscape, A4
+from reportlab.lib.pagesizes import A4, landscape
 from reportlab.lib.styles import ParagraphStyle
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.platypus import Frame, Paragraph, Spacer
 
 
-# ==================================================
-# CONFIGURATION
-# ==================================================
+# ============================================================
+# 1. CONFIGURATION
+# ============================================================
 
 logging.basicConfig(
     level=logging.INFO,
@@ -60,7 +60,7 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 
 GEMINI_MODEL = os.getenv(
     "GEMINI_MODEL",
-    "gemini-2.5-flash"
+    "gemini-3.8-flash"
 ).strip()
 
 GEMINI_URL = (
@@ -69,6 +69,7 @@ GEMINI_URL = (
 )
 
 MAX_TOPIC_LENGTH = 500
+MAX_SLIDES = 12
 
 if not BOT_TOKEN:
     raise RuntimeError(
@@ -88,14 +89,12 @@ bot = Bot(
     )
 )
 
-dp = Dispatcher(
-    storage=MemoryStorage()
-)
+dp = Dispatcher(storage=MemoryStorage())
 
 
-# ==================================================
-# DESIGNS
-# ==================================================
+# ============================================================
+# 2. DESIGN THEMES
+# ============================================================
 
 DESIGNS = {
     "blue": {
@@ -135,9 +134,9 @@ LANGUAGES = {
 }
 
 
-# ==================================================
-# KEYBOARDS
-# ==================================================
+# ============================================================
+# 3. MAIN MENU
+# ============================================================
 
 MAIN_MENU = InlineKeyboardMarkup(
     inline_keyboard=[
@@ -170,10 +169,10 @@ class PresentationForm(StatesGroup):
     design = State()
 
 
-# ==================================================
-# ANIMATED PROGRESS
-# Логіка анімації збережена
-# ==================================================
+# ============================================================
+# 4. PROGRESS ANIMATION
+# НЕ ЗМІНЮВАВ ПОПЕРЕДНЮ ЛОГІКУ АНІМАЦІЇ
+# ============================================================
 
 class ProgressAnimator:
 
@@ -305,9 +304,9 @@ class ProgressAnimator:
             )
 
 
-# ==================================================
-# START
-# ==================================================
+# ============================================================
+# 5. START COMMAND
+# ============================================================
 
 @dp.message(CommandStart())
 async def start_handler(
@@ -320,11 +319,12 @@ async def start_handler(
     await message.answer(
         "🚀 <b>Prezent AI</b>\n\n"
 
-        "Твій AI-помічник для створення красивих презентацій.\n\n"
+        "Твій особистий AI-генератор презентацій!\n\n"
 
         "📊 PowerPoint із переходами між слайдами\n"
         "📄 PDF для перегляду та друку\n"
-        "🎨 Кілька стилів оформлення\n"
+        "🎨 Кілька професійних дизайнів\n"
+        "🧠 Google Gemini 3.8 Flash\n"
         "⚡ Анімований процес створення\n\n"
 
         "Натисни кнопку нижче, щоб почати.",
@@ -347,9 +347,9 @@ async def cancel_handler(
     )
 
 
-# ==================================================
-# FEATURES
-# ==================================================
+# ============================================================
+# 6. FEATURES
+# ============================================================
 
 @dp.callback_query(F.data == "features")
 async def features_handler(
@@ -361,14 +361,16 @@ async def features_handler(
     await callback.message.answer(
         "✨ <b>Можливості Prezent AI</b>\n\n"
 
-        "• AI-план і текст слайдів\n"
+        "• Створення матеріалу через Google Gemini\n"
         "• 6, 8, 10 або 12 слайдів\n"
         "• Українська, англійська або російська\n"
         "• Синій, фіолетовий, темний або світлий дизайн\n"
-        "• PPTX із переходом Fade між слайдами\n"
-        "• PDF із підтримкою українських символів\n\n"
+        "• PowerPoint із переходами Fade\n"
+        "• PDF із підтримкою українських символів\n"
+        "• Анімований процес генерації\n\n"
 
-        "Примітка: складні анімації окремих об'єктів поки не підтримуються."
+        "Примітка: складні анімації окремих об'єктів "
+        "у PowerPoint поки не реалізовані."
     )
 
 
@@ -383,17 +385,19 @@ async def help_handler(
         "📝 <b>Як створити презентацію</b>\n\n"
 
         "1. Натисни «Створити презентацію».\n"
-        "2. Введи тему.\n"
-        "3. Вибери кількість слайдів, мову та дизайн.\n"
-        "4. Дочекайся файлів PPTX і PDF.\n\n"
+        "2. Напиши тему.\n"
+        "3. Вибери кількість слайдів.\n"
+        "4. Вибери мову.\n"
+        "5. Вибери дизайн.\n"
+        "6. Дочекайся готових PPTX і PDF.\n\n"
 
         "Для скасування використовуй /cancel."
     )
 
 
-# ==================================================
-# CREATE PRESENTATION
-# ==================================================
+# ============================================================
+# 7. CREATE PRESENTATION
+# ============================================================
 
 @dp.callback_query(F.data == "create")
 async def create_handler(
@@ -456,17 +460,14 @@ async def topic_handler(
                     text="6",
                     callback_data="slides:6"
                 ),
-
                 InlineKeyboardButton(
                     text="8",
                     callback_data="slides:8"
                 ),
-
                 InlineKeyboardButton(
                     text="10",
                     callback_data="slides:10"
                 ),
-
                 InlineKeyboardButton(
                     text="12",
                     callback_data="slides:12"
@@ -481,9 +482,9 @@ async def topic_handler(
     )
 
 
-# ==================================================
-# SELECT SLIDES
-# ==================================================
+# ============================================================
+# 8. SELECT SLIDES
+# ============================================================
 
 @dp.callback_query(F.data.startswith("slides:"))
 async def slides_handler(
@@ -539,13 +540,11 @@ async def slides_handler(
                     text="🇺🇦 Українська",
                     callback_data="lang:uk"
                 ),
-
                 InlineKeyboardButton(
                     text="🇬🇧 English",
                     callback_data="lang:en"
                 ),
             ],
-
             [
                 InlineKeyboardButton(
                     text="🇷🇺 Русский",
@@ -563,9 +562,9 @@ async def slides_handler(
     await callback.answer()
 
 
-# ==================================================
-# SELECT LANGUAGE
-# ==================================================
+# ============================================================
+# 9. SELECT LANGUAGE
+# ============================================================
 
 @dp.callback_query(F.data.startswith("lang:"))
 async def language_handler(
@@ -608,19 +607,16 @@ async def language_handler(
                     text="🔵 Синій",
                     callback_data="design:blue"
                 ),
-
                 InlineKeyboardButton(
                     text="🟣 Фіолетовий",
                     callback_data="design:purple"
                 ),
             ],
-
             [
                 InlineKeyboardButton(
                     text="⚫ Темний",
                     callback_data="design:dark"
                 ),
-
                 InlineKeyboardButton(
                     text="⚪ Світлий",
                     callback_data="design:light"
@@ -637,9 +633,9 @@ async def language_handler(
     await callback.answer()
 
 
-# ==================================================
-# SELECT DESIGN + GENERATION
-# ==================================================
+# ============================================================
+# 10. SELECT DESIGN AND GENERATE
+# ============================================================
 
 @dp.callback_query(F.data.startswith("design:"))
 async def design_handler(
@@ -688,10 +684,10 @@ async def design_handler(
 
     try:
 
-        # STAGE 1: GEMINI TEXT
+        # STAGE 1: GEMINI
 
         progress.set_stage(
-            "🧠 AI складає план і готує текст слайдів",
+            "🧠 Gemini створює план і текст слайдів",
             62
         )
 
@@ -752,9 +748,9 @@ async def design_handler(
                     pptx_path,
                     filename="PrezentAI.pptx"
                 ),
-
                 caption=(
-                    "📊 <b>PowerPoint</b> — презентація з переходами Fade."
+                    "📊 <b>PowerPoint</b>\n"
+                    "Презентація з переходами Fade."
                 )
             )
 
@@ -763,9 +759,9 @@ async def design_handler(
                     pdf_path,
                     filename="PrezentAI.pdf"
                 ),
-
                 caption=(
-                    "📄 <b>PDF</b> — версія для перегляду та друку."
+                    "📄 <b>PDF</b>\n"
+                    "Версія для перегляду та друку."
                 )
             )
 
@@ -777,12 +773,12 @@ async def design_handler(
     except GeminiAPIError as exc:
 
         log.warning(
-            "Gemini request failed: %s",
+            "Gemini generation failed: %s",
             exc
         )
 
         await progress.finish(
-            "❌ <b>Gemini не зміг створити текст презентації.</b>\n\n"
+            "❌ <b>Gemini не зміг створити презентацію.</b>\n\n"
             f"Причина: {html.escape(str(exc))}\n\n"
             "Перевір API-ключ, модель та квоти Google AI Studio."
         )
@@ -799,21 +795,21 @@ async def design_handler(
         await progress.finish(
             "❌ <b>Не вдалося створити презентацію.</b>\n\n"
             f"Код помилки: <code>{error_id}</code>\n"
-            "Перевір Render Logs для цього коду помилки."
+            "Перевір Render Logs."
         )
 
 
-# ==================================================
-# GEMINI API ERROR
-# ==================================================
+# ============================================================
+# 11. GEMINI ERROR
+# ============================================================
 
 class GeminiAPIError(Exception):
     pass
 
 
-# ==================================================
-# JSON PARSER
-# ==================================================
+# ============================================================
+# 12. JSON PARSER
+# ============================================================
 
 def extract_json(text: str) -> dict:
 
@@ -860,9 +856,9 @@ def extract_json(text: str) -> dict:
         ) from exc
 
 
-# ==================================================
-# GEMINI CONTENT GENERATION
-# ==================================================
+# ============================================================
+# 13. GEMINI 3.8 FLASH API
+# ============================================================
 
 async def generate_content(data: dict) -> dict:
 
@@ -875,13 +871,13 @@ async def generate_content(data: dict) -> dict:
     )
 
     prompt = f"""
-Створи професійну, змістовну презентацію.
+Створи професійну та змістовну презентацію.
 
 Тема: {topic}
 Кількість слайдів: рівно {count}
 Мова: {language}
 
-Поверни виключно коректний JSON:
+Поверни виключно JSON у такому форматі:
 
 {{
   "title": "Назва презентації",
@@ -899,14 +895,16 @@ async def generate_content(data: dict) -> dict:
 }}
 
 Вимоги:
+
 - Рівно {count} слайдів.
 - Логічна структура: вступ, основна частина, висновки.
 - 3-5 змістовних тез на кожному слайді.
 - Без повторів.
 - Не вигадуй статистику.
 - Грамотна мова.
-- Короткі тези, придатні для презентації.
-- Не додавай Markdown або пояснення поза JSON.
+- Короткі тези, придатні для слайда.
+- Не додавай Markdown.
+- Не додавай пояснення поза JSON.
 """.strip()
 
     headers = {
@@ -920,8 +918,9 @@ async def generate_content(data: dict) -> dict:
                 {
                     "text": (
                         "Ти професійний автор навчальних і ділових "
-                        "презентацій. Створюй точний, структурований "
-                        "і грамотний матеріал. Повертай лише JSON."
+                        "презентацій. Створюй якісний, логічний, "
+                        "точний і грамотний матеріал. "
+                        "Повертай тільки валідний JSON."
                     )
                 }
             ]
@@ -931,25 +930,26 @@ async def generate_content(data: dict) -> dict:
             {
                 "role": "user",
                 "parts": [
-                    {"text": prompt}
+                    {
+                        "text": prompt
+                    }
                 ]
             }
         ],
 
         "generationConfig": {
-            "temperature": 0.5,
             "maxOutputTokens": 8192,
             "responseMimeType": "application/json",
 
             "thinkingConfig": {
-                "thinkingBudget": 0
+                "thinkingLevel": "low"
             }
         }
     }
 
     last_error = "Gemini не повернув результат."
 
-    # Two attempts for temporary empty/invalid responses.
+    # Two attempts for temporary empty responses.
 
     for attempt in range(1, 3):
 
@@ -975,7 +975,7 @@ async def generate_content(data: dict) -> dict:
             )
 
             log.warning(
-                "Gemini timeout, attempt=%s",
+                "Gemini timeout; attempt=%s",
                 attempt
             )
 
@@ -1023,38 +1023,39 @@ async def generate_content(data: dict) -> dict:
                 )
             )
 
-            status = response.status_code
+            status_code = response.status_code
 
             log.error(
                 "Gemini API error: HTTP %s, model=%s, message=%s",
-                status,
+                status_code,
                 GEMINI_MODEL,
                 detail[:500]
             )
 
-            if status == 400:
+            if status_code == 400:
 
                 raise GeminiAPIError(
                     "Некоректний запит до Gemini (400). "
                     + detail[:250]
                 )
 
-            if status in (401, 403):
+            if status_code in (401, 403):
 
                 raise GeminiAPIError(
                     "Google не дозволив доступ до API. "
-                    "Перевір GEMINI_API_KEY, проєкт та доступ до моделі. "
-                    + detail[:200]
+                    "Перевір GEMINI_API_KEY, проєкт та дозволи. "
+                    + detail[:220]
                 )
 
-            if status == 404:
+            if status_code == 404:
 
                 raise GeminiAPIError(
-                    f"Модель {GEMINI_MODEL} недоступна. "
-                    "Перевір назву моделі та доступ до неї."
+                    f"Модель {GEMINI_MODEL} не знайдена або "
+                    "недоступна для цього API-проєкту. "
+                    "Перевір назву моделі та доступ."
                 )
 
-            if status == 429:
+            if status_code == 429:
 
                 raise GeminiAPIError(
                     "Перевищено квоту Gemini. "
@@ -1062,7 +1063,7 @@ async def generate_content(data: dict) -> dict:
                 )
 
             raise GeminiAPIError(
-                f"Помилка Google Gemini HTTP {status}: "
+                f"Помилка Google Gemini HTTP {status_code}: "
                 f"{detail[:250]}"
             )
 
@@ -1099,10 +1100,7 @@ async def generate_content(data: dict) -> dict:
                 f"Причина: {block_reason}."
             )
 
-            log.warning(
-                "Gemini returned no candidates: %s",
-                last_error
-            )
+            log.warning(last_error)
 
             if attempt == 1:
 
@@ -1120,14 +1118,14 @@ async def generate_content(data: dict) -> dict:
             "UNKNOWN"
         )
 
-        parts = (
-            candidate.get(
-                "content",
-                {}
-            ).get(
-                "parts",
-                []
-            )
+        candidate_content = candidate.get(
+            "content",
+            {}
+        )
+
+        parts = candidate_content.get(
+            "parts",
+            []
         )
 
         text_parts = []
@@ -1136,6 +1134,8 @@ async def generate_content(data: dict) -> dict:
 
             if not isinstance(part, dict):
                 continue
+
+            # Не включаємо внутрішні thought-частини.
 
             if part.get("thought"):
                 continue
@@ -1161,7 +1161,7 @@ async def generate_content(data: dict) -> dict:
         )
 
         log.info(
-            "Gemini response: model=%s finish=%s "
+            "Gemini result: model=%s finish=%s "
             "prompt_tokens=%s output_tokens=%s "
             "thought_tokens=%s chars=%s attempt=%s",
             GEMINI_MODEL,
@@ -1193,10 +1193,7 @@ async def generate_content(data: dict) -> dict:
                 f"Причина завершення: {finish_reason}."
             )
 
-            log.warning(
-                "Empty Gemini content: %s",
-                last_error
-            )
+            log.warning(last_error)
 
             if attempt == 1:
 
@@ -1277,9 +1274,11 @@ async def generate_content(data: dict) -> dict:
             )
 
             if isinstance(points, str):
+
                 points = [points]
 
             if not isinstance(points, list):
+
                 points = []
 
             points = [
@@ -1306,8 +1305,7 @@ async def generate_content(data: dict) -> dict:
             )
 
         log.info(
-            "Gemini presentation successfully generated: "
-            "slides=%s",
+            "Gemini presentation generated successfully: %s slides",
             count
         )
 
@@ -1327,9 +1325,9 @@ async def generate_content(data: dict) -> dict:
     )
 
 
-# ==================================================
-# POWERPOINT
-# ==================================================
+# ============================================================
+# 14. POWERPOINT TRANSITIONS
+# ============================================================
 
 def add_fade_transition(slide):
 
@@ -1351,6 +1349,10 @@ def add_fade_transition(slide):
         transition
     )
 
+
+# ============================================================
+# 15. POWERPOINT TEXT HELPER
+# ============================================================
 
 def add_text(
     slide,
@@ -1398,6 +1400,10 @@ def add_text(
     return box
 
 
+# ============================================================
+# 16. CREATE POWERPOINT
+# ============================================================
+
 def create_pptx(
     data: dict,
     design: str,
@@ -1443,7 +1449,7 @@ def create_pptx(
             RGBColor(*bg)
         )
 
-        # Accent rail
+        # Decorative accent rail.
 
         rail = slide.shapes.add_shape(
             MSO_SHAPE.RECTANGLE,
@@ -1461,7 +1467,7 @@ def create_pptx(
 
         rail.line.fill.background()
 
-        # Header
+        # Header.
 
         add_text(
             slide,
@@ -1488,7 +1494,7 @@ def create_pptx(
             PP_ALIGN.RIGHT
         )
 
-        # Title
+        # Slide title.
 
         add_text(
             slide,
@@ -1502,7 +1508,7 @@ def create_pptx(
             True
         )
 
-        # Main card
+        # Main content card.
 
         card_shape = slide.shapes.add_shape(
             MSO_SHAPE.ROUNDED_RECTANGLE,
@@ -1521,8 +1527,6 @@ def create_pptx(
         card_shape.line.color.rgb = RGBColor(
             *accent
         )
-
-        # Text inside card
 
         text_box = slide.shapes.add_textbox(
             Inches(1.18),
@@ -1570,16 +1574,16 @@ def create_pptx(
 
             paragraph.level = 0
 
-        # Fade transition
+        # Fade transition.
 
         add_fade_transition(slide)
 
     prs.save(output_path)
 
 
-# ==================================================
-# UNICODE FONT FOR PDF
-# ==================================================
+# ============================================================
+# 17. PDF FONT
+# ============================================================
 
 async def ensure_unicode_font() -> str:
 
@@ -1609,8 +1613,7 @@ async def ensure_unicode_font() -> str:
 
     font_url = (
         "https://raw.githubusercontent.com/"
-        "dejavu-fonts/dejavu-fonts/master/"
-        "ttf/DejaVuSans.ttf"
+        "web-fonts/ttf/master/dejavu-sans-webfont.ttf"
     )
 
     try:
@@ -1634,6 +1637,12 @@ async def ensure_unicode_font() -> str:
                 "Downloaded font is not a valid TrueType file."
             )
 
+        if len(response.content) < 100_000:
+
+            raise RuntimeError(
+                "Downloaded font file is too small."
+            )
+
         target.write_bytes(
             response.content
         )
@@ -1642,15 +1651,18 @@ async def ensure_unicode_font() -> str:
 
     except Exception as exc:
 
+        log.exception(
+            "Could not download Unicode font"
+        )
+
         raise RuntimeError(
-            "Не вдалося отримати шрифт для українського PDF. "
-            "Перевір доступ Render до GitHub."
+            "Не вдалося завантажити шрифт для українського PDF."
         ) from exc
 
 
-# ==================================================
-# PDF GENERATOR
-# ==================================================
+# ============================================================
+# 18. CREATE PDF
+# ============================================================
 
 def create_pdf(
     data: dict,
@@ -1818,14 +1830,21 @@ def create_pdf(
             pdf
         )
 
+        if story:
+
+            log.warning(
+                "Some PDF text did not fit on slide %s",
+                index + 1
+            )
+
         pdf.showPage()
 
     pdf.save()
 
 
-# ==================================================
-# RENDER HTTP HEALTH SERVER
-# ==================================================
+# ============================================================
+# 19. RENDER HTTP HEALTH SERVER
+# ============================================================
 
 async def health_handler(
     reader: asyncio.StreamReader,
@@ -1871,9 +1890,9 @@ async def health_handler(
             pass
 
 
-# ==================================================
-# MAIN
-# ==================================================
+# ============================================================
+# 20. START BOT AND HTTP SERVER
+# ============================================================
 
 async def main():
 
@@ -1919,4 +1938,3 @@ async def main():
 if __name__ == "__main__":
 
     asyncio.run(main())
-
