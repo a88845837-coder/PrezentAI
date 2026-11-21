@@ -5,6 +5,7 @@ import html
 import io
 import json
 import logging
+import math
 import os
 import random
 import re
@@ -22,6 +23,7 @@ import httpx
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramRetryAfter
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -673,65 +675,119 @@ def profile_text(user_id: int):
 # 5. ANIMATION — спінер, іскри, рухома смужка, відсотки, таймер і підказки
 # ============================================================
 class ProgressAnimator:
-    """Animated Telegram progress message with visible error handling.
+    """Live Telegram progress message driven by REAL generation stages.
  
-    Moon spinner, moving sparkles, step checklist, 14-block bar with a colored
-    moving head, smoothly changing percent, elapsed timer and rotating tips.
-    If Telegram refuses to edit the first status message, a fresh bot message
-    is created and the animation goes on.
+    * starts at 1%, ticks about once per second;
+    * percent never decreases and never jumps (max 3% per tick, 5% while catching up);
+    * every stage owns a percent band; inside a band the percent creeps along an
+      easing curve towards (band_end - 1), so it never claims a stage is finished;
+    * 100% is shown only by complete(), which the handler calls AFTER the files
+      have really been sent;
+    * Telegram RetryAfter is respected without blocking the final edit;
+    * a replacement message is created only when the original is truly not editable
+      (never on transient network errors), so no duplicate messages appear.
     """
     SPIN = ("🌑", "🌒", "🌓", "🌔", "🌕", "🌖", "🌗", "🌘")
     HEADS = ("🟪", "🟦", "🟩", "🟨", "🟧", "🟥")
-    SPARK = ("✨      ", " ✨     ", "  ✨    ", "   ✨   ", "    ✨  ", "     ✨ ", "      ✨")
+    SPARK = ("✨      ", " ✨     ", "  ✨    ", "   ✨   ", "    ✨  ", "     ✨ ", "      ✨", "     ✨ ", "    ✨  ", "   ✨   ", "  ✨    ", " ✨     ")
     BAR_LEN = 14
-    TICK_SECONDS = 1.1
-    STEPS = [
-        ("🧠", "Gemini вигадує сюжет і пише тези"),
-        ("🎨", "Малюю макети, фарби й переходи"),
-        ("📄", "Верстаю PDF-версію"),
-        ("📤", "Пакую файли для тебе"),
-    ]
+    TICK_SECONDS = 1.0
+    MAX_STEP = 3        # max growth per tick during normal work
+    CATCHUP_STEP = 5    # max growth per tick when the bar lags behind the real stage
+    STALL_FRAMES = 8    # ticks without change before the "still working" note
+    # key, band start, band end, easing time-constant (s), emoji, label
+    STAGES = (
+        ("launch", 0, 8, 2.0, "⚙️", "Запуск і перевірка налаштувань"),
+        ("ai", 8, 60, 18.0, "🧠", "Аналізую тему та створюю структуру"),
+        ("pptx", 60, 80, 4.0, "🎨", "Розробляю дизайн і візуальні елементи"),
+        ("pdf", 80, 94, 4.0, "📄", "Експортую PDF-документ"),
+        ("check", 94, 98, 2.0, "🔎", "Фінальна перевірка файлів"),
+        ("send", 98, 100, 6.0, "📤", "Готую та надсилаю файли"),
+    )
     TIPS = (
-        "✨ Кожна презентація унікальна — навіть на ту саму тему.",
-        "✏️ У PPTX можна змінювати текст, кольори й порядок слайдів.",
-        "🖨 PDF зручно друкувати та надсилати на пошту.",
-        "🤔 Не сподобалось? Натисни «Повідомити про брак».",
-        "👑 PRO — до 10 презентацій на день.",
-        "🎞 Між слайдами працюють плавні переходи Fade.",
-        "🎨 Спробуй інший стиль — ефект зовсім інший!",
+        "Кожна презентація унікальна — навіть на ту саму тему.",
+        "У PPTX можна змінювати текст, кольори й порядок слайдів.",
+        "PDF зручно друкувати та надсилати на пошту.",
+        "Не сподобалось? Натисни «Повідомити про брак».",
+        "PRO дає до 10 презентацій на день.",
+        "Між слайдами працюють плавні переходи Fade.",
+        "Спробуй інший стиль — ефект зовсім інший!",
+    )
+    NOT_EDITABLE = (
+        "message to edit not found", "message can't be edited",
+        "message_id_invalid", "there is no text in the message",
     )
  
-    def __init__(self, message: Message):
+    def __init__(self, message: Message | None = None):
         self.message = message
-        self.stage = "Підготовка запиту"
-        self.percent = 4
-        self.target = 22
-        self.frame = 0
-        self.step = 0
-        self.labels = list(self.STEPS)
+        self.percent = 1
+        self.stage_index = 0
+        self.stage_started = time.monotonic()
         self.started = time.monotonic()
+        self.frame = 0
+        self.last_change_frame = 0
+        self.finalizing = False
+        self.blocked_until = 0.0
         self.task = None
         self.lock = asyncio.Lock()
         self.running = False
         self.fallback_used = False
         self.last_rendered = None
  
-    def set_stage(self, text: str, target: int, step: int | None = None):
-        self.stage = text
-        if step is not None and 0 <= step < len(self.labels):
-            self.step = step
-        self.target = max(self.percent, min(98, int(target)))
+    # ---------- state ----------
+    def set_stage(self, key: str):
+        """Move to a real stage. Only forward moves are accepted."""
+        for index, stage in enumerate(self.STAGES):
+            if stage[0] == key:
+                if index > self.stage_index:
+                    self.stage_index = index
+                    self.stage_started = time.monotonic()
+                return
+        log.warning("Unknown progress stage: %s", key)
  
-    def render(self):
+    def _band_of(self, percent: int) -> int:
+        if percent >= 100:
+            return len(self.STAGES)
+        for index, stage in enumerate(self.STAGES):
+            if stage[1] <= percent < stage[2]:
+                return index
+        return len(self.STAGES) - 1
+ 
+    def _set_percent(self, value: int):
+        value = int(value)
+        if not self.finalizing:
+            value = min(value, 99)
+        value = min(value, 100)
+        if value > self.percent:          # never decrease
+            self.percent = value
+            self.last_change_frame = self.frame
+ 
+    def _desired(self) -> int:
+        _, lo, hi, tau, _, _ = self.STAGES[self.stage_index]
+        cap = hi - 1                       # a running stage never shows its own end
+        elapsed = time.monotonic() - self.stage_started
+        return int(lo + (cap - lo) * (1 - math.exp(-elapsed / tau)))
+ 
+    def _tick_percent(self):
+        desired = self._desired()
+        if desired <= self.percent:
+            return
+        lo = self.STAGES[self.stage_index][1]
+        limit = self.CATCHUP_STEP if self.percent < lo else self.MAX_STEP
+        self._set_percent(min(desired, self.percent + limit))
+ 
+    # ---------- rendering ----------
+    def render(self) -> str:
         elapsed = int(time.monotonic() - self.started)
         spin = self.SPIN[self.frame % len(self.SPIN)]
         spark = self.SPARK[self.frame % len(self.SPARK)]
         dots = "." * (self.frame % 4)
+        shown = self._band_of(self.percent)
         lines = []
-        for i, (emoji, label) in enumerate(self.labels):
-            if i < self.step:
+        for index, (_, _, _, _, emoji, label) in enumerate(self.STAGES):
+            if index < shown:
                 lines.append(f"✅ {label}")
-            elif i == self.step:
+            elif index == shown:
                 lines.append(f"{emoji} <b>{label}</b>{dots}")
             else:
                 lines.append(f"▫️ <i>{label}</i>")
@@ -739,56 +795,54 @@ class ProgressAnimator:
         bar = "🟦" * filled
         if filled < self.BAR_LEN:
             bar += self.HEADS[self.frame % len(self.HEADS)] + "⬜" * (self.BAR_LEN - filled - 1)
-        tip = self.TIPS[(self.frame // 5) % len(self.TIPS)]
-        title = "Готово!" if self.percent >= 100 else "Prezent AI творить магію"
+        note = ""
+        if not self.finalizing and self.frame - self.last_change_frame >= self.STALL_FRAMES:
+            note = "\n⏳ <i>Цей етап триває довше, ніж зазвичай. Я працюю — не зависло.</i>\n"
+        tip = self.TIPS[(self.frame // 6) % len(self.TIPS)]
         return (
-            f"{spin} <b>{title}</b>\n<code>{spark}</code>\n\n"
+            f"{spin} <b>PREZENT AI</b> — <i>CREATING YOUR PRESENTATION</i>\n"
+            f"<code>{spark}</code>\n\n"
             + "\n".join(lines)
-            + f"\n\n{bar}\n<b>{self.percent}%</b>  •  ⏱ {elapsed // 60}:{elapsed % 60:02d}\n\n"
-            f"💡 <i>{tip}</i>"
+            + f"\n\n{bar}\n<b>{self.percent}%</b>  •  ⏱ {elapsed // 60}:{elapsed % 60:02d}\n"
+            + note
+            + f"\n💡 <i>{tip}</i>"
         )
  
-    async def safe_edit(self):
-        """Update the existing message; recover with a new one if it is not editable."""
+    # ---------- Telegram I/O ----------
+    async def safe_edit(self, wait: bool = False) -> bool:
+        """Edit the status message. Never raises; returns True when the edit landed."""
+        now = time.monotonic()
+        if now < self.blocked_until:
+            if not wait:
+                return False                # skip this tick, Telegram asked us to slow down
+            await asyncio.sleep(min(self.blocked_until - now, 15.0))
         text = self.render()
         async with self.lock:
             try:
                 await self.message.edit_text(text, parse_mode=ParseMode.HTML)
                 self.last_rendered = text
                 return True
+            except TelegramRetryAfter as exc:
+                self.blocked_until = time.monotonic() + float(exc.retry_after) + 0.3
+                log.warning("Progress edit rate-limited; paused for %s s", exc.retry_after)
+                return False
             except Exception as exc:
                 error_text = str(exc).lower()
                 if "message is not modified" in error_text:
                     return True
- 
-                retry_after = getattr(exc, "retry_after", None)
-                if retry_after:
-                    log.warning(
-                        "Progress edit rate-limited; retry after %s seconds",
-                        retry_after,
-                    )
-                    await asyncio.sleep(min(float(retry_after), 5.0))
-                    return False
- 
                 log.warning(
-                    "Progress message edit failed (chat=%s, message=%s): %s",
+                    "Progress edit failed (chat=%s, message=%s): %s",
                     getattr(getattr(self.message, "chat", None), "id", None),
-                    getattr(self.message, "message_id", None),
-                    exc,
+                    getattr(self.message, "message_id", None), exc,
                 )
- 
-                # A new bot-authored message is editable even if the first
-                # status message came from a context Telegram will not edit.
-                if not self.fallback_used:
+                # Create a replacement ONLY when the old message really cannot be edited.
+                if not self.fallback_used and any(m in error_text for m in self.NOT_EDITABLE):
                     try:
-                        replacement = await self.message.answer(
-                            text,
-                            parse_mode=ParseMode.HTML,
-                        )
+                        replacement = await self.message.answer(text, parse_mode=ParseMode.HTML)
                         self.message = replacement
                         self.fallback_used = True
                         self.last_rendered = text
-                        log.info("Progress animation recovered using a new status message")
+                        log.info("Progress animation moved to a new status message")
                         return True
                     except Exception:
                         log.exception("Could not create replacement progress message")
@@ -798,21 +852,16 @@ class ProgressAnimator:
         self.running = True
         try:
             while self.running:
+                began = time.monotonic()
                 self.frame += 1
-                gap = self.target - self.percent
-                if gap > 0:
-                    self.percent += max(1, min(4, gap // 5))  # плавне доганяння цілі
-                elif self.percent < min(96, self.target + 8):
-                    if self.frame % 2 == 0:
-                        self.percent += 1  # повільний рух, щоб не виглядало завислим
+                self._tick_percent()
                 try:
                     await self.safe_edit()
                 except asyncio.CancelledError:
                     raise
                 except Exception:
-                    # Never let a Telegram edit error silently kill the ticker.
                     log.exception("Unexpected progress animation error")
-                await asyncio.sleep(self.TICK_SECONDS)
+                await asyncio.sleep(max(0.25, self.TICK_SECONDS - (time.monotonic() - began)))
         except asyncio.CancelledError:
             raise
         finally:
@@ -825,36 +874,53 @@ class ProgressAnimator:
         self.task = asyncio.create_task(self.run(), name="prezent-ai-progress")
  
     async def stop(self):
+        """Idempotent: always leaves no background task behind."""
         self.running = False
-        if self.task and not self.task.done():
-            self.task.cancel()
+        task, self.task = self.task, None
+        if task and not task.done():
+            task.cancel()
             try:
-                await self.task
+                await task
             except asyncio.CancelledError:
                 pass
+            except Exception:
+                log.exception("Progress task ended with an error")
  
     async def complete(self, text: str):
-        """Дотягує смужку до 100% з анімацією, потім показує фінальний текст."""
+        """Call ONLY after the files were really sent: glides to 100%, then shows `text`."""
         await self.stop()
-        self.step = len(self.labels)
+        self.finalizing = True
         while self.percent < 100:
             self.frame += 1
-            self.percent = min(100, self.percent + 6)
-            await self.safe_edit()
-            await asyncio.sleep(0.45)
-        await asyncio.sleep(0.5)
+            gap = 100 - self.percent
+            self._set_percent(self.percent + max(1, min(5, gap // 3)))
+            await self.safe_edit(wait=True)
+            await asyncio.sleep(0.5)
+        await asyncio.sleep(0.6)
         await self.finish(text)
  
     async def finish(self, text: str):
+        """Replace the progress message with the final text (success, error or cancel)."""
         await self.stop()
-        try:
-            await self.message.edit_text(text, parse_mode=ParseMode.HTML)
-        except Exception as exc:
-            log.warning("Could not edit final progress message: %s", exc)
+        for _ in range(3):
+            wait = self.blocked_until - time.monotonic()
+            if wait > 0:
+                await asyncio.sleep(min(wait, 15.0))
             try:
-                await self.message.answer(text, parse_mode=ParseMode.HTML)
-            except Exception:
-                log.exception("Could not send final progress message")
+                await self.message.edit_text(text, parse_mode=ParseMode.HTML)
+                return
+            except TelegramRetryAfter as exc:
+                self.blocked_until = time.monotonic() + float(exc.retry_after) + 0.3
+                continue
+            except Exception as exc:
+                if "message is not modified" in str(exc).lower():
+                    return
+                log.warning("Could not edit final progress message: %s", exc)
+                break
+        try:
+            await self.message.answer(text, parse_mode=ParseMode.HTML)
+        except Exception:
+            log.exception("Could not send final progress message")
  
 # ============================================================
 # 6. GEMINI API
@@ -1880,27 +1946,31 @@ async def design_handler(callback: CallbackQuery, state: FSMContext):
     data["design"] = design
     await state.clear()
     await callback.answer("Починаю створення!")
-    status = await callback.message.answer(
-        "🌑 <b>Prezent AI запускається...</b>\n\n🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 4%",
-        reply_markup=MAIN_KEYBOARD,
-    )
-    progress = ProgressAnimator(status)
-    current_task = asyncio.current_task()
-    ACTIVE_GENERATIONS[user_id] = current_task
-    progress.start()
+    progress = ProgressAnimator()
+    ACTIVE_GENERATIONS[user_id] = asyncio.current_task()
     generation_id = uuid.uuid4().hex[:16]
-    succeeded = False
+    succeeded = False  # True after the PPTX was really delivered (quota is then spent)
     try:
-        progress.set_stage("AI складає план і пише текст", 62, step=0)
+        status = await callback.message.answer(progress.render(), reply_markup=MAIN_KEYBOARD)
+        progress.message = status
+        progress.start()
+ 
+        # --- 8–60%: AI analyses the topic and writes the slides ---
+        progress.set_stage("ai")
         presentation_data = await generate_content(data)
-        progress.set_stage("Створюю макети й дизайн слайдів", 82, step=1)
+ 
         with tempfile.TemporaryDirectory(prefix="prezent_ai_") as tmp:
             pptx_path = str(Path(tmp) / "PrezentAI.pptx")
             pdf_path = str(Path(tmp) / "PrezentAI.pdf")
+ 
+            # --- 60–80%: PowerPoint ---
+            progress.set_stage("pptx")
             await asyncio.to_thread(create_pptx, presentation_data, design, pptx_path)
             if not Path(pptx_path).exists():
                 raise RuntimeError("PowerPoint file was not created.")
-            progress.set_stage("Готую PDF-файл", 94, step=2)
+ 
+            # --- 80–94%: PDF ---
+            progress.set_stage("pdf")
             pdf_ready, pdf_error = False, None
             try:
                 font_path = await ensure_unicode_font()
@@ -1909,10 +1979,19 @@ async def design_handler(callback: CallbackQuery, state: FSMContext):
             except Exception as exc:
                 pdf_error = str(exc)
                 log.exception("PDF generation failed")
-            await progress.complete(
-                "✅ <b>Презентація готова!</b>\n\n📤 Надсилаю PowerPoint та PDF..." if pdf_ready
-                else "✅ <b>PowerPoint створено!</b>\n\n⚠️ PDF не вдалося підготувати. Надсилаю PPTX."
-            )
+ 
+            # --- 94–98%: real file check ---
+            progress.set_stage("check")
+            if Path(pptx_path).stat().st_size <= 0:
+                raise RuntimeError("PowerPoint file is empty.")
+            if pdf_ready and Path(pdf_path).stat().st_size <= 0:
+                pdf_ready = False
+                pdf_error = pdf_error or "PDF file is empty."
+            if pdf_error:
+                log.error("PDF unavailable: %s", pdf_error)
+ 
+            # --- 98–99%: sending. 100% is shown only after BOTH sends finished ---
+            progress.set_stage("send")
             add_history(generation_id, user_id, data["topic"], design, data["slides"], quota["mode"], "completed")
             pptx_message = await callback.message.answer_document(
                 FSInputFile(pptx_path, filename="PrezentAI.pptx"),
@@ -1926,19 +2005,28 @@ async def design_handler(callback: CallbackQuery, state: FSMContext):
             )
             succeeded = True
             set_history_message(generation_id, pptx_message.chat.id, pptx_message.message_id)
+            pdf_sent = False
             if pdf_ready:
-                await callback.message.answer_document(
-                    FSInputFile(pdf_path, filename="PrezentAI.pdf"),
-                    caption="📄 <b>PDF</b> • версія для перегляду та друку.",
-                    reply_markup=MAIN_KEYBOARD,
-                )
-            else:
+                try:
+                    await callback.message.answer_document(
+                        FSInputFile(pdf_path, filename="PrezentAI.pdf"),
+                        caption="📄 <b>PDF</b> • версія для перегляду та друку.",
+                        reply_markup=MAIN_KEYBOARD,
+                    )
+                    pdf_sent = True
+                except Exception:
+                    log.exception("PDF could not be sent")
+            if not pdf_sent:
                 await callback.message.answer(
-                    "PPTX готовий. PDF цього разу не створився. Перевір Render Logs, якщо це повторюється.",
+                    "PPTX готовий. PDF цього разу надіслати не вдалося. Перевір Render Logs, якщо це повторюється.",
                     reply_markup=MAIN_KEYBOARD,
                 )
-            if pdf_error:
-                log.error("PDF unavailable: %s", pdf_error)
+ 
+        # Files are really delivered: glide to 100% and show the final text.
+        await progress.complete(
+            "✅ <b>Презентація готова!</b>\n\nPowerPoint і PDF надіслано 📤" if pdf_sent
+            else "✅ <b>PowerPoint створено й надіслано!</b>\n\n⚠️ PDF цього разу не вдалося надіслати."
+        )
         await callback.message.answer(
             "✅ <b>Готово!</b>\n\nМожеш створити наступну презентацію кнопкою нижче.",
             reply_markup=MAIN_KEYBOARD,
@@ -1948,7 +2036,9 @@ async def design_handler(callback: CallbackQuery, state: FSMContext):
         if not succeeded:
             release_generation(user_id, quota)
             mark_history_failed(generation_id)
-        await progress.finish("❌ <b>Створення зупинено.</b>\n\nЛіміт/кредит повернуто.")
+            await progress.finish("❌ <b>Створення зупинено.</b>\n\nЛіміт/кредит повернуто.")
+        else:
+            await progress.finish("ℹ️ <b>Презентацію вже надіслано.</b>\n\nЛіміт використано.")
         return
     except GeminiAPIError as exc:
         if not succeeded:
@@ -1961,17 +2051,23 @@ async def design_handler(callback: CallbackQuery, state: FSMContext):
         )
         await callback.message.answer("Можеш повторити спробу через меню.", reply_markup=MAIN_KEYBOARD)
     except Exception:
+        error_id = uuid.uuid4().hex[:8].upper()
+        log.exception("Presentation generation failed; error_id=%s", error_id)
         if not succeeded:
             release_generation(user_id, quota)
             mark_history_failed(generation_id)
-        error_id = uuid.uuid4().hex[:8].upper()
-        log.exception("Presentation generation failed; error_id=%s", error_id)
-        await progress.finish(
-            "❌ <b>Не вдалося створити презентацію.</b>\n\n"
-            f"Код помилки: <code>{error_id}</code>\nКредит або денний ліміт повернуто."
-        )
-        await callback.message.answer("Перевір Render Logs або спробуй пізніше.", reply_markup=MAIN_KEYBOARD)
+            await progress.finish(
+                "❌ <b>Не вдалося створити презентацію.</b>\n\n"
+                f"Код помилки: <code>{error_id}</code>\nКредит або денний ліміт повернуто."
+            )
+            await callback.message.answer("Перевір Render Logs або спробуй пізніше.", reply_markup=MAIN_KEYBOARD)
+        else:
+            await progress.finish(
+                "⚠️ <b>Презентацію надіслано, але під час завершення сталась помилка.</b>\n\n"
+                f"Код помилки: <code>{error_id}</code>"
+            )
     finally:
+        await progress.stop()  # no leaked background task on any path
         ACTIVE_GENERATIONS.pop(user_id, None)
  
  
