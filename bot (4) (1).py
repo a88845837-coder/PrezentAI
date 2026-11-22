@@ -1,4 +1,3 @@
-
 import asyncio
 import hashlib
 import html
@@ -18,11 +17,12 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from xml.sax.saxutils import escape
 from zoneinfo import ZoneInfo
- 
+
 import httpx
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ParseMode
+from aiogram.utils.chat_action import ChatActionSender
 from aiogram.exceptions import TelegramRetryAfter
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
@@ -35,14 +35,14 @@ from aiogram.types import (
 )
 from aiogram.client.default import DefaultBotProperties
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
- 
+
 from pptx import Presentation
 from pptx.dml.color import RGBColor
 from pptx.enum.shapes import MSO_SHAPE
 from pptx.enum.text import PP_ALIGN, MSO_ANCHOR
 from pptx.oxml.xmlchemy import OxmlElement
 from pptx.util import Inches, Pt
- 
+
 from reportlab.lib import colors
 from reportlab.lib.enums import TA_LEFT, TA_CENTER
 from reportlab.lib.pagesizes import A4, landscape
@@ -51,7 +51,7 @@ from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen import canvas
 from reportlab.platypus import Paragraph
- 
+
 # ============================================================
 # 1. CONFIGURATION
 # ============================================================
@@ -60,7 +60,7 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 log = logging.getLogger("prezent-ai")
- 
+
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite").strip()
@@ -71,6 +71,8 @@ DATABASE_PATH = os.getenv("DATABASE_PATH", "prezentai.sqlite3").strip()
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 RENDER_IS_HOSTED = bool(os.getenv("RENDER_EXTERNAL_URL", "").strip())
 MAX_TOPIC_LENGTH = 500
+CHAT_HISTORY_LIMIT = 12
+CHAT_INPUT_LIMIT = 3500
 FREE_DAILY_LIMIT = 3
 PRO_DAILY_LIMIT = 10
 CREDIT_PACK_SIZE = 5
@@ -78,18 +80,18 @@ CREDIT_PACK_PRICE = 15
 PRO_PRICE = 99
 PRO_DAYS = 30
 KYIV_TZ = ZoneInfo("Europe/Kyiv")
- 
+
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is missing in Render Environment.")
 if not GEMINI_API_KEY:
     raise RuntimeError("GEMINI_API_KEY is missing in Render Environment.")
- 
+
 if not DATABASE_URL:
     Path(DATABASE_PATH).expanduser().resolve().parent.mkdir(parents=True, exist_ok=True)
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher(storage=MemoryStorage())
 ACTIVE_GENERATIONS = {}
- 
+
 # ============================================================
 # 2. DATABASE
 # ============================================================
@@ -97,21 +99,21 @@ class PostgreSQLConnection:
     """Tiny adapter so the same queries work with SQLite or hosted Postgres."""
     def __init__(self, connection):
         self.connection = connection
- 
+
     def execute(self, sql, params=()):
         sql = sql.replace("BEGIN IMMEDIATE", "BEGIN")
         sql = sql.replace("?", "%s")
         return self.connection.execute(sql, params or ())
- 
+
     def executescript(self, script):
         for statement in script.split(";"):
             statement = statement.strip()
             if statement:
                 self.execute(statement)
- 
+
     def __enter__(self):
         return self
- 
+
     def __exit__(self, exc_type, exc, tb):
         try:
             if exc_type:
@@ -121,8 +123,8 @@ class PostgreSQLConnection:
         finally:
             self.connection.close()
         return False
- 
- 
+
+
 def db_connect():
     if DATABASE_URL:
         try:
@@ -137,8 +139,8 @@ def db_connect():
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
     return conn
- 
- 
+
+
 def init_db():
     with db_connect() as con:
         con.executescript("""
@@ -188,27 +190,44 @@ def init_db():
             handled_by BIGINT,
             handled_at TEXT
         );
+        CREATE TABLE IF NOT EXISTS chat_messages (
+            message_id TEXT PRIMARY KEY,
+            user_id BIGINT NOT NULL,
+            role TEXT NOT NULL,
+            content TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS support_tickets (
+            ticket_id TEXT PRIMARY KEY,
+            user_id BIGINT NOT NULL,
+            username TEXT DEFAULT '',
+            message TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'open',
+            created_at TEXT NOT NULL
+        );
         CREATE INDEX IF NOT EXISTS idx_history_user ON generation_history(user_id, created_at);
         CREATE INDEX IF NOT EXISTS idx_reports_status ON reports(status);
+        CREATE INDEX IF NOT EXISTS idx_chat_user ON chat_messages(user_id, created_at);
+        CREATE INDEX IF NOT EXISTS idx_support_status ON support_tickets(status);
         """)
- 
- 
+
+
 def now_utc():
     return datetime.now(timezone.utc)
- 
- 
+
+
 def now_iso():
     return now_utc().isoformat()
- 
- 
+
+
 def today_key():
     return datetime.now(KYIV_TZ).date().isoformat()
- 
- 
+
+
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
- 
- 
+
+
 def register_user(user):
     with db_connect() as con:
         con.execute(
@@ -216,13 +235,67 @@ def register_user(user):
             "ON CONFLICT(user_id) DO UPDATE SET username=excluded.username, first_name=excluded.first_name",
             (user.id, user.username or "", user.first_name or "", now_iso()),
         )
- 
- 
+
+
 def get_user(user_id: int):
     with db_connect() as con:
         return con.execute("SELECT * FROM users WHERE user_id=?", (user_id,)).fetchone()
- 
- 
+
+
+def save_chat_message(user_id: int, role: str, content: str):
+    """Persist one chat message so conversation context survives app restarts."""
+    if role not in ("user", "model"):
+        raise ValueError("Unsupported chat role")
+    cleaned = (content or "").strip()[:6000]
+    if not cleaned:
+        return
+    with db_connect() as con:
+        con.execute(
+            "INSERT INTO chat_messages(message_id,user_id,role,content,created_at) VALUES(?,?,?,?,?)",
+            (uuid.uuid4().hex, user_id, role, cleaned, now_iso()),
+        )
+        # Keep a compact rolling memory instead of growing without a limit.
+        con.execute(
+            "DELETE FROM chat_messages WHERE user_id=? AND message_id NOT IN "
+            "(SELECT message_id FROM chat_messages WHERE user_id=? ORDER BY created_at DESC LIMIT ?)",
+            (user_id, user_id, CHAT_HISTORY_LIMIT * 4),
+        )
+
+
+def get_chat_history(user_id: int, limit: int = CHAT_HISTORY_LIMIT):
+    with db_connect() as con:
+        rows = con.execute(
+            "SELECT role,content FROM chat_messages WHERE user_id=? ORDER BY created_at DESC LIMIT ?",
+            (user_id, max(2, min(limit, 30))),
+        ).fetchall()
+    return list(reversed(rows))
+
+
+def clear_chat_history(user_id: int):
+    with db_connect() as con:
+        con.execute("DELETE FROM chat_messages WHERE user_id=?", (user_id,))
+
+
+def create_support_ticket(user_id: int, username: str, message: str) -> str:
+    ticket_id = uuid.uuid4().hex[:10].upper()
+    with db_connect() as con:
+        con.execute(
+            "INSERT INTO support_tickets(ticket_id,user_id,username,message,created_at) VALUES(?,?,?,?,?)",
+            (ticket_id, user_id, username or "", (message or "")[:3500], now_iso()),
+        )
+    return ticket_id
+
+
+def get_user_history(user_id: int, limit: int = 8):
+    with db_connect() as con:
+        return con.execute(
+            "SELECT generation_id,topic,design,slides,created_at,source_chat_id,source_message_id "
+            "FROM generation_history WHERE user_id=? AND status='completed' "
+            "ORDER BY created_at DESC LIMIT ?",
+            (user_id, max(1, min(limit, 20))),
+        ).fetchall()
+
+
 def get_usage(user_id: int) -> int:
     with db_connect() as con:
         row = con.execute(
@@ -230,8 +303,8 @@ def get_usage(user_id: int) -> int:
             (user_id, today_key()),
         ).fetchone()
         return int(row["used"]) if row else 0
- 
- 
+
+
 def subscription_active(row) -> bool:
     if not row or not row["subscription_until"]:
         return False
@@ -239,8 +312,8 @@ def subscription_active(row) -> bool:
         return datetime.fromisoformat(row["subscription_until"]) > now_utc()
     except ValueError:
         return False
- 
- 
+
+
 def reserve_generation(user_id: int):
     """Reserve one daily quota slot or one purchased credit atomically."""
     if is_admin(user_id):
@@ -274,8 +347,8 @@ def reserve_generation(user_id: int):
                     "credits": credits - 1, "day": day}
         return {"allowed": False, "mode": "none", "used": used, "limit": limit,
                 "credits": credits, "day": day}
- 
- 
+
+
 def release_generation(user_id: int, quota: dict):
     """Restore the exact reserved quota slot/credit even if midnight passed."""
     mode = quota.get("mode", "none")
@@ -289,8 +362,8 @@ def release_generation(user_id: int, quota: dict):
                 "UPDATE daily_usage SET used=CASE WHEN used > 0 THEN used - 1 ELSE 0 END WHERE user_id=? AND day=?",
                 (user_id, quota.get("day") or today_key()),
             )
- 
- 
+
+
 def add_history(generation_id, user_id, topic, design, slides, quota_mode, status="completed"):
     with db_connect() as con:
         con.execute(
@@ -298,24 +371,24 @@ def add_history(generation_id, user_id, topic, design, slides, quota_mode, statu
             "VALUES(?,?,?,?,?,?,?,?)",
             (generation_id, user_id, topic, design, slides, quota_mode, status, now_iso()),
         )
- 
- 
+
+
 def set_history_message(generation_id: str, chat_id: int, message_id: int):
     with db_connect() as con:
         con.execute(
             "UPDATE generation_history SET source_chat_id=?, source_message_id=? WHERE generation_id=?",
             (chat_id, message_id, generation_id),
         )
- 
- 
+
+
 def mark_history_failed(generation_id: str):
     with db_connect() as con:
         con.execute(
             "UPDATE generation_history SET status='failed' WHERE generation_id=?",
             (generation_id,),
         )
- 
- 
+
+
 def create_order(user_id: int, product: str, amount: int) -> str:
     payload = f"pzt:{product}:{user_id}:{uuid.uuid4().hex[:16]}"
     with db_connect() as con:
@@ -324,13 +397,13 @@ def create_order(user_id: int, product: str, amount: int) -> str:
             (payload, user_id, product, amount, "pending", now_iso()),
         )
     return payload
- 
- 
+
+
 def find_order(payload: str):
     with db_connect() as con:
         return con.execute("SELECT * FROM orders WHERE payload=?", (payload,)).fetchone()
- 
- 
+
+
 def process_payment(payload: str, user_id: int, amount: int, currency: str, charge_id: str):
     if currency != "XTR":
         return False, "Неправильна валюта платежу."
@@ -344,10 +417,13 @@ def process_payment(payload: str, user_id: int, amount: int, currency: str, char
         if int(order["amount"]) != amount or order["status"] != "pending":
             return False, "Сума або статус платежу не збігається."
         duplicate = con.execute(
-            "SELECT 1 FROM orders WHERE charge_id=?", (charge_id,)
+            "SELECT payload FROM orders WHERE charge_id=?", (charge_id,)
         ).fetchone()
         if duplicate:
-            return True, "already_paid"
+            # A charge may only fulfil the exact same order once.
+            if duplicate["payload"] == payload:
+                return True, "already_paid"
+            return False, "Цей платіжний ідентифікатор уже використано для іншого замовлення."
         if order["product"] == "credits":
             con.execute("UPDATE users SET credits=credits+? WHERE user_id=?", (CREDIT_PACK_SIZE, user_id))
         elif order["product"] == "pro":
@@ -367,8 +443,8 @@ def process_payment(payload: str, user_id: int, amount: int, currency: str, char
             "UPDATE orders SET status='paid', charge_id=? WHERE payload=?", (charge_id, payload)
         )
         return True, order["product"]
- 
- 
+
+
 def create_report(generation_id: str, user_id: int, reason: str) -> str | None:
     with db_connect() as con:
         gen = con.execute(
@@ -389,8 +465,8 @@ def create_report(generation_id: str, user_id: int, reason: str) -> str | None:
             (report_id, generation_id, user_id, reason[:1000], now_iso()),
         )
         return report_id
- 
- 
+
+
 def get_report(report_id: str):
     with db_connect() as con:
         return con.execute(
@@ -398,8 +474,8 @@ def get_report(report_id: str):
             "FROM reports r LEFT JOIN generation_history g ON g.generation_id=r.generation_id "
             "WHERE r.report_id=?", (report_id,)
         ).fetchone()
- 
- 
+
+
 def handle_report(report_id: str, admin_id: int, action: str):
     with db_connect() as con:
         con.execute("BEGIN IMMEDIATE")
@@ -416,7 +492,7 @@ def handle_report(report_id: str, admin_id: int, action: str):
             (status, admin_id, now_iso(), report_id),
         )
         return int(report["user_id"]), status
- 
+
 # ============================================================
 # 2b. BACKUPS (SQLite без зовнішньої бази)
 # ============================================================
@@ -432,8 +508,8 @@ def make_db_snapshot():
         dst.close()
         src.close()
     return str(snap)
- 
- 
+
+
 async def backup_to_admins(reason="auto"):
     if DATABASE_URL or not ADMIN_IDS:
         return
@@ -457,14 +533,14 @@ async def backup_to_admins(reason="auto"):
                 log.warning("Could not send backup to admin %s", admin_id)
     finally:
         Path(path).unlink(missing_ok=True)
- 
- 
+
+
 async def backup_loop():
     while True:
         await asyncio.sleep(6 * 3600)
         await backup_to_admins("авто, кожні 6 год")
- 
- 
+
+
 def restore_db_from(path: str):
     src = sqlite3.connect(path)
     try:
@@ -476,7 +552,7 @@ def restore_db_from(path: str):
             dst.close()
     finally:
         src.close()
- 
+
 # ============================================================
 # 3. KEYBOARDS AND THEMES
 # ============================================================
@@ -490,18 +566,23 @@ BTN_HELP = "❓ Допомога"
 BTN_PROFILE = "👤 Мій профіль"
 BTN_SHOP = "⭐ Магазин"
 BTN_SUB = "👑 Підписка PRO"
- 
+BTN_WORKS = "📚 Мої роботи"
+BTN_STYLES = "🎨 Стилі"
+BTN_SUPPORT = "💬 Підтримка"
+
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text=BTN_START), KeyboardButton(text=BTN_RESTART)],
         [KeyboardButton(text=BTN_CREATE)],
-        [KeyboardButton(text=BTN_PROFILE), KeyboardButton(text=BTN_SHOP)],
-        [KeyboardButton(text=BTN_SUB)],
+        [KeyboardButton(text=BTN_WORKS), KeyboardButton(text=BTN_PROFILE)],
+        [KeyboardButton(text=BTN_STYLES), KeyboardButton(text=BTN_SHOP)],
+        [KeyboardButton(text=BTN_SUB), KeyboardButton(text=BTN_SUPPORT)],
         [KeyboardButton(text=BTN_HOME), KeyboardButton(text=BTN_CANCEL)],
         [KeyboardButton(text=BTN_FEATURES), KeyboardButton(text=BTN_HELP)],
-    ], resize_keyboard=True, is_persistent=True, input_field_placeholder="Обери дію в меню..."
+    ], resize_keyboard=True, is_persistent=True,
+    input_field_placeholder="Напиши повідомлення або обери дію..."
 )
- 
+
+
 # Layout key: color palette + compositional style. These are real design variations,
 # not merely recolored copies of the same slide.
 DESIGNS = {
@@ -517,8 +598,20 @@ DESIGNS = {
     "mono": {"name": "Чорно-білий", "bg": (245, 245, 245), "accent": (25, 25, 25), "card": (255, 255, 255), "text": (28, 28, 28), "muted": (105, 105, 105), "style": "mono"},
 }
 LANGUAGES = {"uk": "українською", "en": "англійською", "ru": "російською"}
+PURPOSES = {
+    "school": "Навчальна презентація для школи: зрозуміла мова, наочні приклади, цікава подача.",
+    "university": "Академічна презентація: точні визначення, аргументи, логічна структура та обережна робота з фактами.",
+    "business": "Ділова презентація: професійний тон, чіткі висновки, практична цінність та орієнтація на рішення.",
+    "speech": "Презентація для виступу: сильний вступ, плавна розповідь, виразні ключові думки та фінальний акцент.",
+}
+PURPOSE_LABELS = {"school": "Школа", "university": "Університет", "business": "Бізнес", "speech": "Виступ"}
+DEPTH_LABELS = {"standard": "Стандартно", "detailed": "Детально"}
+DEPTHS = {
+    "standard": "Стандартна глибина: збалансовані пояснення, основні поняття та доречні приклади.",
+    "detailed": "Детальна глибина: більше пояснень, контексту, прикладів і логічних зв'язків, але без перевантаження слайдів.",
+}
 LAYOUTS = {"cover", "split", "cards", "timeline", "steps", "quote", "comparison", "focus", "closing"}
- 
+
 # Різноманітність: щоразу випадковий ракурс, тон, початок і оформлення.
 CREATIVE_ANGLES = [
     "через історію та реальні життєві ситуації", "через проблеми і способи їх вирішення",
@@ -543,31 +636,53 @@ COVER_SHAPES = (
     (MSO_SHAPE.HEXAGON, MSO_SHAPE.OVAL),
     (MSO_SHAPE.ROUNDED_RECTANGLE, MSO_SHAPE.OVAL),
 )
- 
+
 class PresentationForm(StatesGroup):
     topic = State()
+    purpose = State()
     slides = State()
     language = State()
+    depth = State()
     design = State()
- 
+
 class ReportForm(StatesGroup):
     reason = State()
- 
- 
+
+
+class SupportForm(StatesGroup):
+    message = State()
+
+
+def purpose_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎒 Школа", callback_data="purpose:school"),
+         InlineKeyboardButton(text="🎓 Університет", callback_data="purpose:university")],
+        [InlineKeyboardButton(text="💼 Бізнес", callback_data="purpose:business"),
+         InlineKeyboardButton(text="🎤 Виступ", callback_data="purpose:speech")],
+    ])
+
+
 def slides_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text=str(n), callback_data=f"slides:{n}") for n in (6, 8, 10, 12)
     ]])
- 
- 
+
+
+def depth_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="⚖️ Стандартно", callback_data="depth:standard"),
+        InlineKeyboardButton(text="📚 Детально", callback_data="depth:detailed"),
+    ]])
+
+
 def language_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🇺🇦 Українська", callback_data="lang:uk"),
          InlineKeyboardButton(text="🇬🇧 English", callback_data="lang:en")],
         [InlineKeyboardButton(text="🇷🇺 Русский", callback_data="lang:ru")],
     ])
- 
- 
+
+
 def design_keyboard():
     rows, row = [], []
     for key, theme in DESIGNS.items():
@@ -578,61 +693,83 @@ def design_keyboard():
     if row:
         rows.append(row)
     return InlineKeyboardMarkup(inline_keyboard=rows)
- 
- 
+
+
 def shop_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🎟️ 5 генерацій — 15 ⭐", callback_data="buy:credits")],
         [InlineKeyboardButton(text="👑 PRO на 30 днів — 99 ⭐", callback_data="buy:pro")],
         [InlineKeyboardButton(text="👤 Мій профіль", callback_data="profile")],
     ])
- 
- 
+
+
 def report_admin_keyboard(report_id: str):
     return InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="✅ Повернути 1 кредит", callback_data=f"reportact:{report_id}:refund"),
         InlineKeyboardButton(text="❌ Відхилити", callback_data=f"reportact:{report_id}:reject"),
     ]])
- 
- 
+
+
 def report_user_keyboard(generation_id: str):
     return InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="⚠️ Повідомити про брак", callback_data=f"bad:{generation_id}")
     ]])
- 
+
 # ============================================================
 # 4. TEXTS AND PROFILE
 # ============================================================
 WELCOME_TEXT = (
-    "👋 <b>Привіт, {name}!</b>\n\n"
-    "🚀 Я <b>Prezent AI</b> — твій особистий дизайнер презентацій.\n"
-    "Скажи тему, а за хвилину отримаєш готові слайди ✨\n\n"
-    "🎨 10 стильних тем\n📊 6, 8, 10 або 12 слайдів\n"
-    "🧠 Розумні тези від Google Gemini\n📄 PowerPoint + PDF одразу\n"
-    "🎞️ Плавні переходи між слайдами\n\n"
-    "🎁 Щодня <b>3 презентації безкоштовно</b>!\n"
-    "⭐ Мало? Додаткові генерації — у магазині.\n\n"
-    "Тисни «🎨 Створити презентацію» і поїхали 👇"
+    "✦ <b>PREZENT AI</b>\n"
+    "<i>Твоя персональна студія презентацій</i>\n\n"
+    "Привіт, {name}! Радий бачити тебе. 👋\n\n"
+    "Перетворюй ідеї на продумані презентації — від першої думки до готового PowerPoint і PDF.\n\n"
+    "<b>Твій простір для роботи:</b>\n"
+    "🎨 10 візуальних напрямів\n"
+    "📊 6, 8, 10 або 12 слайдів\n"
+    "🧠 AI допомагає зі структурою та змістом\n"
+    "📄 PowerPoint + PDF\n"
+    "✨ Персональні рекомендації та допомога в чаті\n\n"
+    "🎁 <b>Щодня доступно 3 безкоштовні генерації.</b>\n\n"
+    "Розкажи, що хочеш створити, або натисни кнопку нижче."
 )
 FEATURES_TEXT = (
-    "✨ <b>Можливості Prezent AI</b>\n\n"
-    "🎨 10 тем: Мінімалізм, Футуризм, Business Pro, Шкільний креатив, "
-    "Luxury, Журнал, Eco, Яскравий, Класичний і Чорно-білий.\n"
-    "🧩 Різні макети: обкладинка, картки, таймлайн, кроки, цитата, "
-    "порівняння, великий акцент і фінальний слайд.\n"
-    "📊 6/8/10/12 слайдів • 🇺🇦 🇬🇧 🇷🇺 • PPTX + PDF.\n"
-    "⚠️ Кнопка «Повідомити про брак» надсилає презентацію адміну на перевірку."
+    "✦ <b>МОЖЛИВОСТІ PREZENT AI</b>\n\n"
+    "<b>Створення</b>\n"
+    "• 6, 8, 10 або 12 слайдів\n"
+    "• Українська, English або російська\n"
+    "• PowerPoint та PDF\n\n"
+    "<b>Візуальні напрями</b>\n"
+    "Мінімалізм, Футуризм, Business Pro, Шкільний креатив, Luxury, Журнал, Eco / Nature, Яскравий, Класичний і Чорно-білий.\n\n"
+    "<b>Допомога</b>\n"
+    "Можеш написати мені звичайним повідомленням: допоможу сформувати тему, вибрати стиль або розібратися з налаштуваннями.\n\n"
+    "Після генерації доступна кнопка повідомлення про проблему з файлом."
 )
 HELP_TEXT = (
-    "❓ <b>Допомога</b>\n\n"
-    "🚀 Старт — головне меню.\n🎨 Створити презентацію — запустити генератор.\n"
-    "👤 Мій профіль — ліміти, кредити та PRO.\n⭐ Магазин — придбати генерації.\n"
-    "👑 Підписка PRO — 10 презентацій на день протягом 30 днів.\n"
-    "❌ Скасувати — зупинити створення.\n\n"
-    "/start — меню • /shop — магазин • /id — показати твій Telegram ID"
+    "✦ <b>ЦЕНТР ДОПОМОГИ</b>\n\n"
+    "🎨 <b>Створити презентацію</b> — запусти майстер створення.\n"
+    "📚 <b>Мої роботи</b> — знайди й повторно завантаж останні презентації.\n"
+    "👤 <b>Мій профіль</b> — переглянь ліміти, кредити та підписку.\n"
+    "⭐ <b>Магазин</b> — додаткові генерації та PRO.\n"
+    "💬 <b>Підтримка</b> — надішли звернення команді.\n\n"
+    "Команди: /start, /help, /shop, /history, /support, /paysupport, /cancel, /clearchat.\n\n"
+    "Можеш просто написати мені запитання — я спробую допомогти."
 )
- 
- 
+STYLES_TEXT = (
+    "✦ <b>ВІЗУАЛЬНІ СТИЛІ</b>\n\n"
+    "<b>Minimalism</b> — чистий простір, стриманість і фокус на змісті.\n"
+    "<b>Future</b> — технологічна атмосфера та виразні акценти.\n"
+    "<b>Business Pro</b> — ділова структура для професійних виступів.\n"
+    "<b>School Creative</b> — тепла, яскрава подача для навчання.\n"
+    "<b>Luxury</b> — темна преміальна естетика із золотими деталями.\n"
+    "<b>Magazine</b> — редакційна композиція, як у сучасному журналі.\n"
+    "<b>Eco / Nature</b> — природні відтінки та спокійний візуальний ритм.\n"
+    "<b>Vibrant</b> — сміливі кольори та енергійна подача.\n"
+    "<b>Classic</b> — універсальне, збалансоване оформлення.\n"
+    "<b>Monochrome</b> — чорно-біла виразність і мінімум відволікань.\n\n"
+    "Найкращий стиль залежить від теми та аудиторії. Можеш запитати мене, який підійде саме для твоєї ідеї."
+)
+
+
 def format_until(value):
     if not value:
         return "не активна"
@@ -641,8 +778,8 @@ def format_until(value):
         return dt.strftime("%d.%m.%Y о %H:%M")
     except ValueError:
         return "не активна"
- 
- 
+
+
 def profile_text(user_id: int):
     row = get_user(user_id)
     if not row:
@@ -656,27 +793,27 @@ def profile_text(user_id: int):
             "SELECT COUNT(*) AS n FROM generation_history WHERE user_id=? AND status='completed'",
             (user_id,),
         ).fetchone()["n"]
-    if is_admin(user_id):
-        daily = "∞ (адміністратор)"
-    else:
-        daily = f"{used}/{limit} використано • залишилось {remaining}"
-    sub = f"активна до {format_until(row['subscription_until'])}" if pro else "не активна"
+    plan = "ADMIN" if is_admin(user_id) else ("PRO" if pro else "FREE")
+    daily = f"{used}/{limit} використано" if not is_admin(user_id) else "Без обмежень"
+    until = format_until(row["subscription_until"]) if pro else "не активна"
     return (
-        "👤 <b>Твій профіль Prezent AI</b>\n\n"
-        f"🆔 ID: <code>{user_id}</code>\n"
-        f"📊 Презентацій створено: <b>{total}</b>\n"
+        "✦ <b>ТВІЙ ПРОФІЛЬ PREZENT AI</b>\n\n"
+        f"Статус: <b>{plan}</b>\n"
+        f"📊 Створено презентацій: <b>{total}</b>\n"
         f"🎁 Денний ліміт: <b>{daily}</b>\n"
-        f"🎟️ Додаткові кредити: <b>{row['credits']}</b>\n"
-        f"👑 Підписка PRO: <b>{sub}</b>\n\n"
-        "Кредити витрачаються після використання денного ліміту."
+        f"✨ Залишилось сьогодні: <b>{remaining}</b>\n"
+        f"🎟️ Додаткові генерації: <b>{row['credits']}</b>\n"
+        f"👑 PRO до: <b>{until}</b>\n\n"
+        "Твої додаткові кредити використовуються після денного ліміту."
     )
- 
+
+
 # ============================================================
 # 5. ANIMATION — спінер, іскри, рухома смужка, відсотки, таймер і підказки
 # ============================================================
 class ProgressAnimator:
     """Live Telegram progress message driven by REAL generation stages.
- 
+
     * starts at 1%, ticks about once per second;
     * percent never decreases and never jumps (max 3% per tick, 5% while catching up);
     * every stage owns a percent band; inside a band the percent creeps along an
@@ -717,7 +854,7 @@ class ProgressAnimator:
         "message to edit not found", "message can't be edited",
         "message_id_invalid", "there is no text in the message",
     )
- 
+
     def __init__(self, message: Message | None = None):
         self.message = message
         self.percent = 1
@@ -733,7 +870,7 @@ class ProgressAnimator:
         self.running = False
         self.fallback_used = False
         self.last_rendered = None
- 
+
     # ---------- state ----------
     def set_stage(self, key: str):
         """Move to a real stage. Only forward moves are accepted."""
@@ -744,7 +881,7 @@ class ProgressAnimator:
                     self.stage_started = time.monotonic()
                 return
         log.warning("Unknown progress stage: %s", key)
- 
+
     def _band_of(self, percent: int) -> int:
         if percent >= 100:
             return len(self.STAGES)
@@ -752,7 +889,7 @@ class ProgressAnimator:
             if stage[1] <= percent < stage[2]:
                 return index
         return len(self.STAGES) - 1
- 
+
     def _set_percent(self, value: int):
         value = int(value)
         if not self.finalizing:
@@ -761,13 +898,13 @@ class ProgressAnimator:
         if value > self.percent:          # never decrease
             self.percent = value
             self.last_change_frame = self.frame
- 
+
     def _desired(self) -> int:
         _, lo, hi, tau, _, _ = self.STAGES[self.stage_index]
         cap = hi - 1                       # a running stage never shows its own end
         elapsed = time.monotonic() - self.stage_started
         return int(lo + (cap - lo) * (1 - math.exp(-elapsed / tau)))
- 
+
     def _tick_percent(self):
         desired = self._desired()
         if desired <= self.percent:
@@ -775,19 +912,18 @@ class ProgressAnimator:
         lo = self.STAGES[self.stage_index][1]
         limit = self.CATCHUP_STEP if self.percent < lo else self.MAX_STEP
         self._set_percent(min(desired, self.percent + limit))
- 
+
     # ---------- rendering ----------
     def render(self) -> str:
         elapsed = int(time.monotonic() - self.started)
         spin = self.SPIN[self.frame % len(self.SPIN)]
         spark = self.SPARK[self.frame % len(self.SPARK)]
         dots = "." * (self.frame % 4)
-        shown = self._band_of(self.percent)
         lines = []
         for index, (_, _, _, _, emoji, label) in enumerate(self.STAGES):
-            if index < shown:
+            if index < self.stage_index:
                 lines.append(f"✅ {label}")
-            elif index == shown:
+            elif index == self.stage_index:
                 lines.append(f"{emoji} <b>{label}</b>{dots}")
             else:
                 lines.append(f"▫️ <i>{label}</i>")
@@ -800,14 +936,14 @@ class ProgressAnimator:
             note = "\n⏳ <i>Цей етап триває довше, ніж зазвичай. Я працюю — не зависло.</i>\n"
         tip = self.TIPS[(self.frame // 6) % len(self.TIPS)]
         return (
-            f"{spin} <b>PREZENT AI</b> — <i>CREATING YOUR PRESENTATION</i>\n"
+            f"{spin} <b>PREZENT AI</b> — <i>СТВОРЮЮ ТВОЮ ПРЕЗЕНТАЦІЮ</i>\n"
             f"<code>{spark}</code>\n\n"
             + "\n".join(lines)
             + f"\n\n{bar}\n<b>{self.percent}%</b>  •  ⏱ {elapsed // 60}:{elapsed % 60:02d}\n"
             + note
             + f"\n💡 <i>{tip}</i>"
         )
- 
+
     # ---------- Telegram I/O ----------
     async def safe_edit(self, wait: bool = False) -> bool:
         """Edit the status message. Never raises; returns True when the edit landed."""
@@ -847,7 +983,7 @@ class ProgressAnimator:
                     except Exception:
                         log.exception("Could not create replacement progress message")
                 return False
- 
+
     async def run(self):
         self.running = True
         try:
@@ -866,13 +1002,13 @@ class ProgressAnimator:
             raise
         finally:
             self.running = False
- 
+
     def start(self):
         if self.task and not self.task.done():
             return
         self.running = True
         self.task = asyncio.create_task(self.run(), name="prezent-ai-progress")
- 
+
     async def stop(self):
         """Idempotent: always leaves no background task behind."""
         self.running = False
@@ -885,7 +1021,7 @@ class ProgressAnimator:
                 pass
             except Exception:
                 log.exception("Progress task ended with an error")
- 
+
     async def complete(self, text: str):
         """Call ONLY after the files were really sent: glides to 100%, then shows `text`."""
         await self.stop()
@@ -898,7 +1034,7 @@ class ProgressAnimator:
             await asyncio.sleep(0.5)
         await asyncio.sleep(0.6)
         await self.finish(text)
- 
+
     async def finish(self, text: str):
         """Replace the progress message with the final text (success, error or cancel)."""
         await self.stop()
@@ -921,7 +1057,7 @@ class ProgressAnimator:
             await self.message.answer(text, parse_mode=ParseMode.HTML)
         except Exception:
             log.exception("Could not send final progress message")
- 
+
 # ============================================================
 # 6. GEMINI API
 # ============================================================
@@ -933,8 +1069,8 @@ class GeminiModelUnavailable(GeminiAPIError):
     pass
 class GeminiResponseError(GeminiAPIError):
     pass
- 
- 
+
+
 def extract_json(text: str) -> dict:
     if not isinstance(text, str) or not text.strip():
         raise GeminiResponseError("Gemini повернув порожню відповідь.")
@@ -947,8 +1083,8 @@ def extract_json(text: str) -> dict:
         return json.loads(cleaned[start:end + 1])
     except json.JSONDecodeError as exc:
         raise GeminiResponseError("Gemini повернув неправильний JSON.") from exc
- 
- 
+
+
 async def request_gemini(model: str, prompt: str) -> dict:
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
     headers = {"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"}
@@ -1026,12 +1162,104 @@ async def request_gemini(model: str, prompt: str) -> dict:
             raise GeminiRetryableError("Gemini тричі повернув порожню відповідь.")
         return extract_json(content)
     raise GeminiRetryableError(f"Модель {model} не повернула результат.")
- 
- 
+
+
+CHAT_SYSTEM_PROMPT = """
+Ти — Prezent AI, уважний, доброзичливий і компетентний персональний AI-помічник.
+Ти представляєш професійний сервіс створення презентацій.
+
+ТВОЯ МАНЕРА:
+- Спілкуйся природно, тепло, впевнено й без канцеляризмів.
+- Відповідай мовою користувача; за замовчуванням українською.
+- Не повторюй ім'я, привітання або однакові фрази в кожній відповіді.
+- Будь стислим, але достатньо докладним для реальної користі.
+- Не використовуй надмірно емодзі, пафос, фальшиву похвалу чи нав'язливі продажі.
+- Не погоджуйся автоматично: ввічливо виправляй помилки й пояснюй чому.
+
+ТВОЯ РОЛЬ:
+- Допомагай створювати презентації, добирати тему, структуру, тон, стиль і кількість слайдів.
+- Пояснюй можливості Prezent AI та допомагай користуватися ботом.
+- Відповідай на звичайні запитання, якщо можеш зробити це надійно.
+- Якщо користувач не знає, що обрати, запропонуй один найкращий варіант і коротко поясни вибір.
+- Пам'ятай попередній контекст розмови, не перепитуй уже надане.
+
+ЧЕСНІСТЬ І БЕЗПЕКА:
+- Не вигадуй статус платежу, баланс, ціни, ліміти, наявність функцій чи завершення генерації.
+- Не стверджуй, що можеш змінити обліковий запис, повернути оплату або запустити генерацію, якщо це не зроблено сервером.
+- Поточні тарифи: FREE — 3 генерації на день; PRO — до 10 на день протягом 30 днів за 99 Telegram Stars; пакет — 5 додаткових генерацій за 15 Stars. Не обіцяй інші умови.
+- Якщо питання стосується конкретного балансу чи покупки, попроси відкрити профіль або магазин; не вгадуй персональні дані.
+- Якщо не знаєш відповіді, чесно скажи про це й запропонуй звернутися до підтримки.
+
+ГОЛОВНЕ:
+Допомагай людині досягати результату й відчувати, що її час та запит цінують. Не перетворюй кожну відповідь на рекламу сервісу.
+""".strip()
+
+
+async def request_gemini_chat(user_id: int, user_message: str) -> str:
+    """Natural-language chat endpoint, separate from the JSON slide generator."""
+    history = get_chat_history(user_id, CHAT_HISTORY_LIMIT)
+    contents = []
+    for row in history:
+        role = row["role"]
+        if role not in ("user", "model"):
+            continue
+        content = str(row["content"] or "").strip()
+        if content:
+            contents.append({"role": role, "parts": [{"text": content[:6000]}]})
+    contents.append({"role": "user", "parts": [{"text": user_message[:CHAT_INPUT_LIMIT]}]})
+
+    models = list(dict.fromkeys([m for m in (GEMINI_MODEL, GEMINI_FALLBACK_MODEL) if m]))
+    last_error = None
+    for model in models:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+        headers = {"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"}
+        payload = {
+            "systemInstruction": {"parts": [{"text": CHAT_SYSTEM_PROMPT}]},
+            "contents": contents,
+            "generationConfig": {
+                "maxOutputTokens": 1200,
+                "temperature": 0.78,
+                "topP": 0.92,
+            },
+        }
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(55.0, connect=15.0)) as client:
+                response = await client.post(url, headers=headers, json=payload)
+            if response.status_code in (408, 429, 500, 502, 503, 504):
+                last_error = f"temporary HTTP {response.status_code}"
+                continue
+            result = response.json()
+            if not isinstance(result, dict):
+                raise ValueError("Gemini returned a non-object response")
+            if response.status_code >= 400 or result.get("error"):
+                last_error = str(result.get("error", {}).get("message", f"HTTP {response.status_code}"))
+                continue
+            candidates = result.get("candidates", [])
+            if not candidates:
+                last_error = "empty candidates"
+                continue
+            parts = candidates[0].get("content", {}).get("parts", [])
+            answer = "\n".join(
+                part.get("text", "").strip()
+                for part in parts
+                if isinstance(part, dict) and isinstance(part.get("text"), str)
+                and not part.get("thought")
+            ).strip()
+            if answer:
+                return answer[:12000]
+            last_error = "empty text response"
+        except (httpx.HTTPError, ValueError) as exc:
+            last_error = str(exc)
+            log.warning("Gemini chat model %s failed: %s", model, exc)
+    raise GeminiRetryableError(f"Розмовний AI тимчасово недоступний: {last_error or 'unknown error'}")
+
+
 async def generate_content(data: dict) -> dict:
     topic, count = data["topic"], data["slides"]
     language = LANGUAGES.get(data["language"], "українською")
     style_name = DESIGNS[data["design"]]["name"]
+    purpose = PURPOSES.get(data.get("purpose", "school"), PURPOSES["school"])
+    depth = DEPTHS.get(data.get("depth", "standard"), DEPTHS["standard"])
     angle = random.choice(CREATIVE_ANGLES)
     tone = random.choice(CREATIVE_TONES)
     hook = random.choice(CREATIVE_HOOKS)
@@ -1042,12 +1270,14 @@ async def generate_content(data: dict) -> dict:
 СЛАЙДІВ: рівно {count}
 МОВА: {language}
 ВІЗУАЛЬНИЙ СТИЛЬ: {style_name}
- 
+ПРИЗНАЧЕННЯ: {purpose}
+ГЛИБИНА МАТЕРІАЛУ: {depth}
+
 УНІКАЛЬНІСТЬ (код варіації {variation_id}):
 - Ракурс подачі: {angle}
 - Тон: {tone}
 - Початок: {hook}
- 
+
 Поверни тільки JSON такої структури:
 {{
   "title":"Назва презентації",
@@ -1058,7 +1288,7 @@ async def generate_content(data: dict) -> dict:
       "right_title":"права колонка"}}
   ]
 }}
- 
+
 ДОЗВОЛЕНІ layout: cover, split, cards, timeline, steps, quote, comparison, focus, closing.
 Правила дизайну й контенту:
 1. Перший слайд — сильна обкладинка, останній — висновок/заклик/підсумок.
@@ -1074,6 +1304,8 @@ async def generate_content(data: dict) -> dict:
 9. Рівно {count} слайдів. Поза JSON не додавай нічого.
 10. Кожна генерація має бути унікальною: інша структура, інші заголовки й приклади, ніж у типовій відповіді на цю тему. Уникай шаблонних заголовків («Вступ», «Що таке…», «Висновки») та банальних формулювань.
 11. Дотримуйся вказаного ракурсу, тону й початку, але не вигадуй фактів.
+12. Підлаштовуй лексику, приклади й складність матеріалу під призначення презентації.
+13. Детальна глибина означає глибші пояснення, а не дрібний або надмірний текст на слайдах.
 """.strip()
     models = list(dict.fromkeys([m for m in (GEMINI_MODEL, GEMINI_FALLBACK_MODEL) if m]))
     last_error = None
@@ -1117,7 +1349,7 @@ async def generate_content(data: dict) -> dict:
         except GeminiAPIError:
             raise
     raise GeminiAPIError(f"Не вдалося отримати презентацію. Остання помилка: {last_error}")
- 
+
 # ============================================================
 # 7. SLIDE LAYOUT ENGINE — композиції PowerPoint
 # ============================================================
@@ -1151,12 +1383,12 @@ def assign_layouts(slides):
                 chosen = random.choice(choices or ["split", "cards", "focus"])
         item["layout"] = chosen
         previous = chosen
- 
- 
+
+
 def rgb(value):
     return RGBColor(*value)
- 
- 
+
+
 def add_shape(slide, kind, x, y, w, h, fill, line=None, radius=False):
     shape_type = MSO_SHAPE.ROUNDED_RECTANGLE if radius else kind
     shape = slide.shapes.add_shape(shape_type, Inches(x), Inches(y), Inches(w), Inches(h))
@@ -1168,8 +1400,8 @@ def add_shape(slide, kind, x, y, w, h, fill, line=None, radius=False):
     else:
         shape.line.fill.background()
     return shape
- 
- 
+
+
 def add_text(slide, text, x, y, w, h, size, color, bold=False,
              align=PP_ALIGN.LEFT, font="Aptos", valign=MSO_ANCHOR.TOP):
     box = slide.shapes.add_textbox(Inches(x), Inches(y), Inches(w), Inches(h))
@@ -1189,8 +1421,8 @@ def add_text(slide, text, x, y, w, h, size, color, bold=False,
     p.font.bold = bold
     p.font.color.rgb = rgb(color)
     return box
- 
- 
+
+
 def add_bullets(slide, points, x, y, w, h, theme, size=18, gap=10):
     points = points[:5]
     total_h = h / max(1, len(points))
@@ -1199,23 +1431,23 @@ def add_bullets(slide, points, x, y, w, h, theme, size=18, gap=10):
         add_shape(slide, MSO_SHAPE.OVAL, x, yy + .12, .12, .12, theme["accent"])
         add_text(slide, point, x + .28, yy, w - .3, total_h - .02,
                  size if len(points) <= 4 else size - 2, theme["text"])
- 
- 
+
+
 def add_header(slide, index, total, theme, title, subtitle=""):
     add_text(slide, "PREZENT AI  /  PRESENTATION", .62, .28, 5.5, .25, 9, theme["accent"], True)
     add_text(slide, f"{index + 1:02d} / {total:02d}", 11.75, .28, .9, .25, 9, theme["muted"], True, PP_ALIGN.RIGHT)
     add_text(slide, title, .68, .72, 11.8, .78, 27, theme["text"], True)
     if subtitle:
         add_text(slide, subtitle, .72, 1.48, 11.7, .45, 12, theme["muted"])
- 
- 
+
+
 def add_fade_transition(slide):
     transition = OxmlElement("p:transition")
     transition.set("spd", "med")
     transition.append(OxmlElement("p:fade"))
     slide._element.insert(2, transition)
- 
- 
+
+
 def add_decor(slide, theme, variant):
     """Random decorative frame so every presentation looks different."""
     a, c = theme["accent"], theme["card"]
@@ -1234,8 +1466,8 @@ def add_decor(slide, theme, variant):
     else:  # blocks
         add_shape(slide, MSO_SHAPE.RECTANGLE, 12.6, 0, .73, 2.2, a)
         add_shape(slide, MSO_SHAPE.RECTANGLE, 12.1, 0, .5, 1.2, c)
- 
- 
+
+
 def create_pptx(data: dict, design: str, output_path: str):
     theme = DESIGNS[design]
     prs = Presentation()
@@ -1335,7 +1567,7 @@ def create_pptx(data: dict, design: str, output_path: str):
                 add_text(slide, item["highlight"], 8.2, 5.65, 3.8, .6, 13, theme["accent"], True, PP_ALIGN.CENTER)
         add_fade_transition(slide)
     prs.save(output_path)
- 
+
 # ============================================================
 # 8. PDF EXPORT
 # ============================================================
@@ -1368,8 +1600,8 @@ async def ensure_unicode_font() -> str:
     except Exception as exc:
         log.exception("Unable to download DejaVu font")
         raise RuntimeError("Не вдалося завантажити шрифт для українського PDF.") from exc
- 
- 
+
+
 def create_pdf(data: dict, design: str, output_path: str, font_path: str):
     theme = DESIGNS[design]
     bg = colors.HexColor("#%02x%02x%02x" % theme["bg"])
@@ -1442,7 +1674,7 @@ def create_pdf(data: dict, design: str, output_path: str, font_path: str):
                 content_y -= hh + 15
         pdf.showPage()
     pdf.save()
- 
+
 # ============================================================
 # 9. USER FLOW AND MENUS
 # ============================================================
@@ -1452,81 +1684,69 @@ async def cancel_active_generation(user_id: int):
     if task and not task.done() and task is not current:
         log.info("Cancellation requested for user %s", user_id)
         task.cancel()
- 
- 
+
+
 def mini_bar(percent: int, length: int = 12) -> str:
     filled = int(percent / 100 * length)
     return "🟦" * filled + "⬜" * (length - filled)
- 
- 
+
+
 async def animated_welcome(message: Message, name: str):
-    frames = [
-        (10, "✨ Запускаю Prezent AI"),
-        (30, "🎨 Фарбую теми"),
-        (55, "🧠 Будимо Gemini"),
-        (80, "📊 Складаю макети"),
-        (100, "🚀 Готово!"),
-    ]
-    msg = await message.answer(
-        f"{frames[0][1]}\n\n{mini_bar(frames[0][0])} {frames[0][0]}%",
-        reply_markup=MAIN_KEYBOARD,
-    )
-    for percent, label in frames[1:]:
-        await asyncio.sleep(0.55)
-        try:
-            await msg.edit_text(f"{label}\n\n{mini_bar(percent)} {percent}%")
-        except Exception:
-            break
-    await asyncio.sleep(0.45)
-    text = WELCOME_TEXT.replace("{name}", html.escape(name or "друже"))
-    try:
-        await msg.edit_text(text)
-    except Exception:
-        await message.answer(text, reply_markup=MAIN_KEYBOARD)
- 
- 
+    """Show the home screen without a fake loading percentage."""
+    safe_name = html.escape(name or "друже")
+    text = WELCOME_TEXT.replace("{name}", safe_name)
+    await message.answer(text, reply_markup=MAIN_KEYBOARD)
+
+
 async def show_home(message: Message, state: FSMContext):
     await cancel_active_generation(message.from_user.id)
     await state.clear()
     register_user(message.from_user)
     await animated_welcome(message, message.from_user.first_name)
- 
- 
+
+
 async def start_creation(message: Message, state: FSMContext):
     await cancel_active_generation(message.from_user.id)
     await state.clear()
     register_user(message.from_user)
     await state.set_state(PresentationForm.topic)
     await message.answer(
-        "📝 <b>Про що буде презентація?</b>\n\n"
-        "Напиши тему — хоч одним реченням ✍️\n"
-        "Наприклад: «Штучний інтелект у сучасному світі».\n"
-        "<i>Максимум 500 символів.</i>", reply_markup=MAIN_KEYBOARD
+        "✦ <b>ПОЧНІМО З ІДЕЇ</b>\n\n"
+        "Про що має бути твоя презентація?\n"
+        "Напиши тему своїми словами — можна коротко або детально.\n\n"
+        "<i>Наприклад: «Як штучний інтелект змінює наше повсякденне життя».</i>\n"
+        f"Максимум {MAX_TOPIC_LENGTH} символів.",
+        reply_markup=MAIN_KEYBOARD,
     )
- 
- 
+
+
 @dp.message(CommandStart())
 async def command_start(message: Message, state: FSMContext):
     await show_home(message, state)
- 
+
 @dp.message(Command("restart"))
 async def command_restart(message: Message, state: FSMContext):
     await cancel_active_generation(message.from_user.id)
     await state.clear()
     register_user(message.from_user)
     await message.answer("🔄 <b>Діалог перезапущено!</b>\n\nМожеш почати нову презентацію.", reply_markup=MAIN_KEYBOARD)
- 
+
 @dp.message(Command("cancel"))
 async def command_cancel(message: Message, state: FSMContext):
     await cancel_active_generation(message.from_user.id)
     await state.clear()
     await message.answer("❌ Поточну дію скасовано.", reply_markup=MAIN_KEYBOARD)
- 
+
+@dp.message(Command("help"))
+async def command_help(message: Message):
+    await message.answer(HELP_TEXT, reply_markup=MAIN_KEYBOARD)
+
+
 @dp.message(Command("id"))
 async def command_id(message: Message):
     register_user(message.from_user)
-    await message.answer(f"Твій Telegram ID: <code>{message.from_user.id}</code>\nДодай його в Render → Environment → ADMIN_IDS.", reply_markup=MAIN_KEYBOARD)
- 
+    await message.answer(f"Твій Telegram ID: <code>{message.from_user.id}</code>", reply_markup=MAIN_KEYBOARD)
+
 @dp.message(Command("adminstats"))
 async def command_adminstats(message: Message):
     if not is_admin(message.from_user.id):
@@ -1538,7 +1758,7 @@ async def command_adminstats(message: Message):
         pending = con.execute("SELECT COUNT(*) n FROM reports WHERE status='pending'").fetchone()["n"]
         revenue = con.execute("SELECT COALESCE(SUM(amount),0) n FROM orders WHERE status='paid'").fetchone()["n"]
     await message.answer(f"🛠 <b>Статистика</b>\nКористувачів: {users}\nГотових презентацій: {gens}\nСкарг очікує: {pending}\nОтримано Stars: {revenue} ⭐")
- 
+
 @dp.message(Command("grant"))
 async def command_grant(message: Message):
     if not is_admin(message.from_user.id):
@@ -1553,7 +1773,7 @@ async def command_grant(message: Message):
         con.execute("INSERT INTO users(user_id, created_at) VALUES(?,?) ON CONFLICT(user_id) DO NOTHING", (uid, now_iso()))
         con.execute("UPDATE users SET credits=credits+? WHERE user_id=?", (amount, uid))
     await message.answer(f"✅ Користувачу <code>{uid}</code> додано кредитів: {amount}")
- 
+
 @dp.message(Command("backup"))
 async def command_backup(message: Message):
     if not is_admin(message.from_user.id):
@@ -1564,7 +1784,7 @@ async def command_backup(message: Message):
         return
     await backup_to_admins("вручну")
     await message.answer("💾 Копію бази надіслано адміністраторам.")
- 
+
 @dp.message(F.document, F.caption == "/restore")
 async def restore_backup_handler(message: Message):
     if not is_admin(message.from_user.id):
@@ -1582,85 +1802,233 @@ async def restore_backup_handler(message: Message):
     except Exception:
         log.exception("Restore failed")
         await message.answer("❌ Не вдалося відновити базу. Файл пошкоджений або це не копія Prezent AI.")
- 
+
 @dp.message(F.text == BTN_START)
 async def button_start(message: Message, state: FSMContext):
     await show_home(message, state)
- 
+
 @dp.message(F.text == BTN_RESTART)
 async def button_restart(message: Message, state: FSMContext):
     await cancel_active_generation(message.from_user.id)
     await state.clear()
     await message.answer("🔄 <b>Діалог перезапущено!</b>", reply_markup=MAIN_KEYBOARD)
- 
+
 @dp.message(F.text == BTN_CREATE)
 async def button_create(message: Message, state: FSMContext):
     await start_creation(message, state)
- 
+
 @dp.message(F.text == BTN_HOME)
 async def button_home(message: Message, state: FSMContext):
     await show_home(message, state)
- 
+
 @dp.message(F.text == BTN_CANCEL)
 async def button_cancel(message: Message, state: FSMContext):
     await cancel_active_generation(message.from_user.id)
     await state.clear()
     await message.answer("❌ Створення скасовано.", reply_markup=MAIN_KEYBOARD)
- 
+
 @dp.message(F.text == BTN_FEATURES)
 async def button_features(message: Message):
     await message.answer(FEATURES_TEXT, reply_markup=MAIN_KEYBOARD)
- 
+
 @dp.message(F.text == BTN_HELP)
 async def button_help(message: Message):
     await message.answer(HELP_TEXT, reply_markup=MAIN_KEYBOARD)
- 
+
+
+@dp.message(F.text == BTN_STYLES)
+async def button_styles(message: Message):
+    await message.answer(STYLES_TEXT, reply_markup=MAIN_KEYBOARD)
+
+
+async def show_user_history(message: Message, user_id: int):
+    rows = get_user_history(user_id, 8)
+    if not rows:
+        await message.answer(
+            "📚 <b>Тут з'являться твої презентації.</b>\n\n"
+            "Щойно створиш першу роботу, зможеш повернутися сюди й завантажити її повторно.",
+            reply_markup=MAIN_KEYBOARD,
+        )
+        return
+    buttons = []
+    for row in rows:
+        date_label = ""
+        try:
+            dt = datetime.fromisoformat(row["created_at"]).astimezone(KYIV_TZ)
+            date_label = dt.strftime("%d.%m")
+        except Exception:
+            pass
+        topic = str(row["topic"] or "Без назви")
+        if len(topic) > 34:
+            topic = topic[:31] + "..."
+        buttons.append([InlineKeyboardButton(
+            text=f"📄 {topic} · {date_label}",
+            callback_data=f"history:{row['generation_id']}"
+        )])
+    await message.answer(
+        "📚 <b>ТВОЇ РОБОТИ</b>\n\n"
+        "Обери презентацію, щоб повторно отримати файл PowerPoint.\n"
+        "Збережені роботи доступні з історії генерацій.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+    )
+
+
+@dp.message(F.text == BTN_WORKS)
+async def button_works(message: Message):
+    await show_user_history(message, message.from_user.id)
+
+
+@dp.message(Command("history"))
+async def command_history(message: Message):
+    await show_user_history(message, message.from_user.id)
+
+
+@dp.callback_query(F.data.startswith("history:"))
+async def history_download_handler(callback: CallbackQuery):
+    generation_id = callback.data.split(":", 1)[1]
+    with db_connect() as con:
+        row = con.execute(
+            "SELECT * FROM generation_history WHERE generation_id=? AND user_id=? AND status='completed'",
+            (generation_id, callback.from_user.id),
+        ).fetchone()
+    if not row or not row["source_chat_id"] or not row["source_message_id"]:
+        await callback.answer("Не вдалося знайти файл цієї роботи.", show_alert=True)
+        return
+    try:
+        await bot.copy_message(
+            chat_id=callback.from_user.id,
+            from_chat_id=int(row["source_chat_id"]),
+            message_id=int(row["source_message_id"]),
+        )
+        await callback.answer("Надіслав файл повторно.")
+    except Exception:
+        log.exception("History re-download failed for %s", generation_id)
+        await callback.answer("Файл зараз недоступний. Напиши підтримці.", show_alert=True)
+
+
+async def begin_support(message: Message, state: FSMContext, payment_issue: bool = False):
+    await state.clear()
+    await state.set_state(SupportForm.message)
+    if payment_issue:
+        intro = "💳 <b>ПІДТРИМКА ОПЛАТИ</b>\n\nОпиши проблему з Telegram Stars, рахунком, зарахуванням кредитів або PRO."
+    else:
+        intro = "💬 <b>ПІДТРИМКА PREZENT AI</b>\n\nОпиши, будь ласка, що сталося або з чим потрібна допомога."
+    await message.answer(
+        intro + "\n\nМожеш вказати номер платежу чи код помилки, але ніколи не надсилай паролі або секретні ключі.\n\n"
+        "Команда отримає звернення з номером заявки. Щоб скасувати — /cancel.",
+        reply_markup=MAIN_KEYBOARD,
+    )
+
+
+@dp.message(F.text == BTN_SUPPORT)
+async def button_support(message: Message, state: FSMContext):
+    await begin_support(message, state)
+
+
+@dp.message(Command("support"))
+async def command_support(message: Message, state: FSMContext):
+    await begin_support(message, state)
+
+
+@dp.message(Command("paysupport"))
+async def command_paysupport(message: Message, state: FSMContext):
+    await begin_support(message, state, payment_issue=True)
+
+
+@dp.message(SupportForm.message)
+async def support_message_handler(message: Message, state: FSMContext):
+    content = (message.text or message.caption or "").strip()
+    if not content:
+        await message.answer("Будь ласка, надішли звернення текстом. Можеш додати скриншот наступним повідомленням.")
+        return
+    if len(content) < 5:
+        await message.answer("Додай трохи більше деталей, щоб команда могла допомогти.")
+        return
+    ticket_id = create_support_ticket(
+        message.from_user.id, message.from_user.username or "", content
+    )
+    delivered = 0
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.send_message(
+                admin_id,
+                "💬 <b>НОВЕ ЗВЕРНЕННЯ PREZENT AI</b>\n\n"
+                f"Заявка: <code>{ticket_id}</code>\n"
+                f"Користувач: <code>{message.from_user.id}</code>\n"
+                f"Username: @{html.escape(message.from_user.username or 'не вказано')}\n\n"
+                f"{html.escape(content[:3500])}",
+            )
+            delivered += 1
+        except Exception:
+            log.exception("Could not deliver support ticket %s", ticket_id)
+    await state.clear()
+    if delivered:
+        await message.answer(
+            "✅ <b>Звернення передано команді.</b>\n\n"
+            f"Номер заявки: <code>{ticket_id}</code>\n"
+            "Збережи цей номер, якщо знадобиться уточнення. Дякуємо, що повідомив про проблему.",
+            reply_markup=MAIN_KEYBOARD,
+        )
+    else:
+        await message.answer(
+            "⚠️ Звернення збережено, але команда поки не отримала сповіщення. "
+            "Спробуй пізніше або звернися до адміністратора бота.\n"
+            f"Номер заявки: <code>{ticket_id}</code>",
+            reply_markup=MAIN_KEYBOARD,
+        )
+
+
 @dp.message(F.text == BTN_PROFILE)
 async def button_profile(message: Message):
     register_user(message.from_user)
     await message.answer(profile_text(message.from_user.id), reply_markup=MAIN_KEYBOARD)
- 
+
 @dp.message(F.text == BTN_SHOP)
 async def button_shop(message: Message):
     await message.answer(
-        "⭐ <b>МАГАЗИН PREZENT AI</b> ⭐\n\n"
-        "🎟️ <b>ПАКЕТ КРЕДИТІВ</b>\n"
-        f"✨ {CREDIT_PACK_SIZE} додаткових генерацій — <b>{CREDIT_PACK_PRICE} ⭐</b>\n"
-        "💡 Кредити не згорають наприкінці дня.\n\n"
-        "👑 <b>ПІДПИСКА PRO</b>\n"
-        f"🚀 До {PRO_DAILY_LIMIT} презентацій щодня протягом {PRO_DAYS} днів — <b>{PRO_PRICE} ⭐</b>\n\n"
-        "🔒 Безпечна оплата безпосередньо через Telegram Stars.", reply_markup=shop_keyboard()
+        "✦ <b>PREZENT AI STORE</b>\n"
+        "<i>Обери формат доступу, який відповідає твоїм задачам.</i>\n\n"
+        "<b>🎟️ Пакет генерацій</b>\n"
+        f"{CREDIT_PACK_SIZE} додаткових презентацій · <b>{CREDIT_PACK_PRICE} ⭐</b>\n"
+        "Кредити залишаються на балансі й використовуються після денного ліміту.\n\n"
+        "<b>👑 Prezent AI PRO</b>\n"
+        f"До {PRO_DAILY_LIMIT} презентацій на день · {PRO_DAYS} днів · <b>{PRO_PRICE} ⭐</b>\n"
+        "Одноразова оплата, автоматичного продовження немає.\n\n"
+        "🔒 Оплата цифрових послуг проходить безпосередньо через Telegram Stars. "
+        "Після успішного платежу бот автоматично зарахує покупку.", reply_markup=shop_keyboard()
     )
- 
+
 @dp.message(Command("shop"))
 async def command_shop(message: Message):
     register_user(message.from_user)
     await button_shop(message)
- 
+
 @dp.message(F.text == BTN_SUB)
 async def button_subscription(message: Message):
     await message.answer(
-        "👑 <b>Підписка PRO</b>\n\n"
-        f"✅ До {PRO_DAILY_LIMIT} презентацій на день\n"
-        f"✅ Діє {PRO_DAYS} днів\n"
-        "✅ Пріоритетний доступ не обіцяю — швидкість залежить від Gemini і Render.\n\n"
-        f"Ціна: <b>{PRO_PRICE} ⭐</b>. Підписка оплачується один раз і автоматично не продовжується.",
+        "👑 <b>PREZENT AI PRO</b>\n\n"
+        f"• До <b>{PRO_DAILY_LIMIT} презентацій щодня</b>\n"
+        f"• Термін дії — <b>{PRO_DAYS} днів</b>\n"
+        "• Звичайний процес створення PowerPoint та PDF\n"
+        "• Без автоматичного продовження\n\n"
+        f"Разова вартість: <b>{PRO_PRICE} ⭐</b>.\n"
+        "Швидкість генерації залежить від доступності AI-сервісу та серверу.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(text=f"👑 Оформити PRO — {PRO_PRICE} ⭐", callback_data="buy:pro")
         ]])
     )
- 
+
 @dp.callback_query(F.data == "profile")
 async def callback_profile(callback: CallbackQuery):
     register_user(callback.from_user)
     await callback.message.answer(profile_text(callback.from_user.id), reply_markup=MAIN_KEYBOARD)
     await callback.answer()
- 
+
 @dp.callback_query(F.data == "create")
 async def inline_create(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
     await start_creation(callback.message, state)
- 
+
 # ============================================================
 # 10. SHOP AND TELEGRAM STARS PAYMENTS
 # ============================================================
@@ -1694,8 +2062,8 @@ async def buy_handler(callback: CallbackQuery):
     except Exception:
         log.exception("Could not send invoice")
         await callback.answer("Не вдалося створити рахунок. Спробуй ще раз.", show_alert=True)
- 
- 
+
+
 @dp.pre_checkout_query()
 async def pre_checkout_handler(query):
     # Telegram requires a response to every pre-checkout query within 10 seconds.
@@ -1719,8 +2087,8 @@ async def pre_checkout_handler(query):
             )
         except Exception:
             log.exception("Could not reject failed pre-checkout query")
- 
- 
+
+
 @dp.message(F.successful_payment)
 async def successful_payment_handler(message: Message):
     payment = message.successful_payment
@@ -1764,7 +2132,7 @@ async def successful_payment_handler(message: Message):
             except Exception:
                 pass
         asyncio.create_task(backup_to_admins("після оплати"))
- 
+
 # ============================================================
 # 11. REPORTS / QUALITY REVIEW
 # ============================================================
@@ -1786,8 +2154,8 @@ async def report_start(callback: CallbackQuery, state: FSMContext):
         reply_markup=MAIN_KEYBOARD,
     )
     await callback.answer("Чекаю опис проблеми.")
- 
- 
+
+
 @dp.message(ReportForm.reason)
 async def report_reason_handler(message: Message, state: FSMContext):
     reason = (message.text or "").strip()
@@ -1831,8 +2199,8 @@ async def report_reason_handler(message: Message, state: FSMContext):
         await message.answer("✅ Скаргу та файл презентації надіслано адміністратору. Після перевірки він зможе повернути 1 кредит.", reply_markup=MAIN_KEYBOARD)
     else:
         await message.answer("⚠️ Скаргу збережено, але адміністратор не отримав повідомлення. Перевір ADMIN_IDS у Render.", reply_markup=MAIN_KEYBOARD)
- 
- 
+
+
 @dp.callback_query(F.data.startswith("reportact:"))
 async def report_action_handler(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
@@ -1863,7 +2231,7 @@ async def report_action_handler(callback: CallbackQuery):
         await callback.message.edit_reply_markup(reply_markup=None)
         await callback.message.answer(f"Скаргу користувача <code>{user_id}</code> відхилено.")
         await callback.answer("Скаргу відхилено.")
- 
+
 # ============================================================
 # 12. GENERATION FLOW
 # ============================================================
@@ -1871,16 +2239,39 @@ async def report_action_handler(callback: CallbackQuery):
 async def topic_handler(message: Message, state: FSMContext):
     topic = (message.text or "").strip()
     if len(topic) < 3:
-        await message.answer("Тема занадто коротка. Напиши хоча б 3 символи.")
+        await message.answer("Тема поки закоротка. Додай кілька слів, щоб я правильно зрозумів задум.")
         return
     if len(topic) > MAX_TOPIC_LENGTH:
-        await message.answer("Тема занадто довга. Максимум 500 символів.")
+        await message.answer(f"Тема завелика. Максимум {MAX_TOPIC_LENGTH} символів.")
         return
     await state.update_data(topic=topic)
+    await state.set_state(PresentationForm.purpose)
+    await message.answer(
+        "🎯 <b>Для чого готуємо презентацію?</b>\n\n"
+        "Це допоможе підібрати правильну подачу, лексику та приклади.",
+        reply_markup=purpose_keyboard(),
+    )
+
+
+@dp.callback_query(F.data.startswith("purpose:"))
+async def purpose_handler(callback: CallbackQuery, state: FSMContext):
+    if await state.get_state() != PresentationForm.purpose.state:
+        await callback.answer("Спочатку введи тему презентації.", show_alert=True)
+        return
+    purpose = callback.data.split(":", 1)[1]
+    if purpose not in PURPOSES:
+        await callback.answer("Обери призначення зі списку.", show_alert=True)
+        return
+    await state.update_data(purpose=purpose)
     await state.set_state(PresentationForm.slides)
-    await message.answer("📊 <b>Скільки слайдів потрібно?</b>\n\nОбери кількість:", reply_markup=slides_keyboard())
- 
- 
+    await callback.message.answer(
+        "📊 <b>Скільки слайдів потрібно?</b>\n\n"
+        "Обери комфортний обсяг презентації:",
+        reply_markup=slides_keyboard(),
+    )
+    await callback.answer()
+
+
 @dp.callback_query(F.data.startswith("slides:"))
 async def slides_handler(callback: CallbackQuery, state: FSMContext):
     if await state.get_state() != PresentationForm.slides.state:
@@ -1898,8 +2289,8 @@ async def slides_handler(callback: CallbackQuery, state: FSMContext):
     await state.set_state(PresentationForm.language)
     await callback.message.answer("🌍 <b>Обери мову презентації:</b>", reply_markup=language_keyboard())
     await callback.answer()
- 
- 
+
+
 @dp.callback_query(F.data.startswith("lang:"))
 async def language_handler(callback: CallbackQuery, state: FSMContext):
     if await state.get_state() != PresentationForm.language.state:
@@ -1910,11 +2301,34 @@ async def language_handler(callback: CallbackQuery, state: FSMContext):
         await callback.answer("Непідтримувана мова.", show_alert=True)
         return
     await state.update_data(language=language)
-    await state.set_state(PresentationForm.design)
-    await callback.message.answer("🎨 <b>Обери один із 10 стилів презентації:</b>", reply_markup=design_keyboard())
+    await state.set_state(PresentationForm.depth)
+    await callback.message.answer(
+        "📚 <b>Якої глибини має бути матеріал?</b>\n\n"
+        "Обери збалансоване пояснення або детальніший розбір.",
+        reply_markup=depth_keyboard(),
+    )
     await callback.answer()
- 
- 
+
+
+@dp.callback_query(F.data.startswith("depth:"))
+async def depth_handler(callback: CallbackQuery, state: FSMContext):
+    if await state.get_state() != PresentationForm.depth.state:
+        await callback.answer("Спочатку обери мову презентації.", show_alert=True)
+        return
+    depth = callback.data.split(":", 1)[1]
+    if depth not in DEPTHS:
+        await callback.answer("Обери один із доступних рівнів.", show_alert=True)
+        return
+    await state.update_data(depth=depth)
+    await state.set_state(PresentationForm.design)
+    await callback.message.answer(
+        "🎨 <b>Обери візуальний стиль</b>\n\n"
+        "У кожного стилю своя атмосфера та характер оформлення.",
+        reply_markup=design_keyboard(),
+    )
+    await callback.answer()
+
+
 @dp.callback_query(F.data.startswith("design:"))
 async def design_handler(callback: CallbackQuery, state: FSMContext):
     user_id = callback.from_user.id
@@ -1929,7 +2343,7 @@ async def design_handler(callback: CallbackQuery, state: FSMContext):
         await callback.answer("Непідтримуваний дизайн.", show_alert=True)
         return
     data = await state.get_data()
-    if not all(k in data for k in ("topic", "slides", "language")):
+    if not all(k in data for k in ("topic", "purpose", "slides", "language", "depth")):
         await state.clear()
         await callback.answer("Налаштування втрачено. Почни спочатку.", show_alert=True)
         return
@@ -1954,21 +2368,21 @@ async def design_handler(callback: CallbackQuery, state: FSMContext):
         status = await callback.message.answer(progress.render(), reply_markup=MAIN_KEYBOARD)
         progress.message = status
         progress.start()
- 
+
         # --- 8–60%: AI analyses the topic and writes the slides ---
         progress.set_stage("ai")
         presentation_data = await generate_content(data)
- 
+
         with tempfile.TemporaryDirectory(prefix="prezent_ai_") as tmp:
             pptx_path = str(Path(tmp) / "PrezentAI.pptx")
             pdf_path = str(Path(tmp) / "PrezentAI.pdf")
- 
+
             # --- 60–80%: PowerPoint ---
             progress.set_stage("pptx")
             await asyncio.to_thread(create_pptx, presentation_data, design, pptx_path)
             if not Path(pptx_path).exists():
                 raise RuntimeError("PowerPoint file was not created.")
- 
+
             # --- 80–94%: PDF ---
             progress.set_stage("pdf")
             pdf_ready, pdf_error = False, None
@@ -1979,7 +2393,7 @@ async def design_handler(callback: CallbackQuery, state: FSMContext):
             except Exception as exc:
                 pdf_error = str(exc)
                 log.exception("PDF generation failed")
- 
+
             # --- 94–98%: real file check ---
             progress.set_stage("check")
             if Path(pptx_path).stat().st_size <= 0:
@@ -1989,7 +2403,7 @@ async def design_handler(callback: CallbackQuery, state: FSMContext):
                 pdf_error = pdf_error or "PDF file is empty."
             if pdf_error:
                 log.error("PDF unavailable: %s", pdf_error)
- 
+
             # --- 98–99%: sending. 100% is shown only after BOTH sends finished ---
             progress.set_stage("send")
             add_history(generation_id, user_id, data["topic"], design, data["slides"], quota["mode"], "completed")
@@ -1998,6 +2412,8 @@ async def design_handler(callback: CallbackQuery, state: FSMContext):
                 caption=(
                     f"📊 <b>{html.escape(presentation_data['title'])}</b>\n"
                     f"🎨 Стиль: {html.escape(DESIGNS[design]['name'])}\n"
+                    f"🎯 Призначення: {html.escape(PURPOSE_LABELS.get(data.get('purpose', 'school'), 'Школа'))}\n"
+                    f"📚 Глибина: {html.escape(DEPTH_LABELS.get(data.get('depth', 'standard'), 'Стандартно'))}\n"
                     "Формат: PowerPoint • переходи Fade\n\n"
                     "Є проблема? Натисни кнопку нижче — адміністратор перегляне файл."
                 ),
@@ -2021,7 +2437,7 @@ async def design_handler(callback: CallbackQuery, state: FSMContext):
                     "PPTX готовий. PDF цього разу надіслати не вдалося. Перевір Render Logs, якщо це повторюється.",
                     reply_markup=MAIN_KEYBOARD,
                 )
- 
+
         # Files are really delivered: glide to 100% and show the final text.
         await progress.complete(
             "✅ <b>Презентація готова!</b>\n\nPowerPoint і PDF надіслано 📤" if pdf_sent
@@ -2045,11 +2461,16 @@ async def design_handler(callback: CallbackQuery, state: FSMContext):
             release_generation(user_id, quota)
             mark_history_failed(generation_id)
         log.warning("Gemini generation failed: %s", exc)
+        error_id = uuid.uuid4().hex[:8].upper()
         await progress.finish(
-            "❌ <b>AI не зміг створити презентацію.</b>\n\n"
-            f"Причина: {html.escape(str(exc))}\n\nКредит або денний ліміт повернуто."
+            "❌ <b>Не вдалося завершити створення.</b>\n\n"
+            "AI-сервіс тимчасово не повернув коректний результат. Твій денний ліміт або кредит відновлено.\n"
+            f"Код звернення: <code>{error_id}</code>"
         )
-        await callback.message.answer("Можеш повторити спробу через меню.", reply_markup=MAIN_KEYBOARD)
+        await callback.message.answer(
+            "Можеш повторити спробу трохи пізніше. Якщо проблема повторюється, надішли код звернення в підтримку.",
+            reply_markup=MAIN_KEYBOARD,
+        )
     except Exception:
         error_id = uuid.uuid4().hex[:8].upper()
         log.exception("Presentation generation failed; error_id=%s", error_id)
@@ -2069,12 +2490,70 @@ async def design_handler(callback: CallbackQuery, state: FSMContext):
     finally:
         await progress.stop()  # no leaked background task on any path
         ACTIVE_GENERATIONS.pop(user_id, None)
- 
- 
+
+
+def split_plain_text(text: str, limit: int = 3400):
+    text = (text or "").strip()
+    chunks = []
+    while len(text) > limit:
+        split_at = text.rfind("\n", 0, limit)
+        if split_at < limit // 2:
+            split_at = text.rfind(" ", 0, limit)
+        if split_at < limit // 2:
+            split_at = limit
+        chunks.append(text[:split_at].strip())
+        text = text[split_at:].strip()
+    if text:
+        chunks.append(text)
+    return chunks or [""]
+
+
+@dp.message(Command("clearchat"))
+async def command_clear_chat(message: Message):
+    clear_chat_history(message.from_user.id)
+    await message.answer("🧹 Історію AI-розмови очищено. Можемо почати з чистого аркуша.", reply_markup=MAIN_KEYBOARD)
+
+
 @dp.message(F.text)
 async def unknown_text(message: Message):
-    await message.answer("Не зрозумів команду. Скористайся кнопками в меню 👇", reply_markup=MAIN_KEYBOARD)
- 
+    user_id = message.from_user.id
+    text_in = (message.text or "").strip()
+    if not text_in:
+        return
+    if len(text_in) > CHAT_INPUT_LIMIT:
+        await message.answer(
+            f"Повідомлення завелике. Надішли, будь ласка, текст до {CHAT_INPUT_LIMIT} символів.",
+            reply_markup=MAIN_KEYBOARD,
+        )
+        return
+    register_user(message.from_user)
+    wait = await message.answer("✦ <b>Prezent AI</b> · слухаю тебе…")
+    try:
+        async with ChatActionSender.typing(bot=bot, chat_id=message.chat.id):
+            answer = await request_gemini_chat(user_id, text_in)
+        save_chat_message(user_id, "user", text_in)
+        save_chat_message(user_id, "model", answer)
+        chunks = split_plain_text(answer)
+        await wait.edit_text(html.escape(chunks[0]), parse_mode=ParseMode.HTML, reply_markup=MAIN_KEYBOARD)
+        for chunk in chunks[1:]:
+            await message.answer(html.escape(chunk), parse_mode=ParseMode.HTML, reply_markup=MAIN_KEYBOARD)
+    except GeminiAPIError:
+        log.exception("Conversational assistant failed for user %s", user_id)
+        await wait.edit_text(
+            "Зараз не вдалося отримати відповідь від AI. Це тимчасова проблема з’єднання. "
+            "Спробуй ще раз трохи пізніше або напиши в «💬 Підтримка».",
+            reply_markup=MAIN_KEYBOARD,
+        )
+    except Exception:
+        log.exception("Unexpected chat handler error for user %s", user_id)
+        try:
+            await wait.edit_text(
+                "Вибач, під час відповіді сталася технічна помилка. Спробуй повторити повідомлення.",
+                reply_markup=MAIN_KEYBOARD,
+            )
+        except Exception:
+            await message.answer("Під час відповіді сталася помилка. Спробуй ще раз.", reply_markup=MAIN_KEYBOARD)
+
 # ============================================================
 # 13. RENDER HEALTH CHECK + WEBHOOK
 # ============================================================
@@ -2083,8 +2562,8 @@ RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
 if not WEBHOOK_SECRET:
     WEBHOOK_SECRET = hashlib.sha256(BOT_TOKEN.encode("utf-8")).hexdigest()
- 
- 
+
+
 async def health_handler(request: web.Request):
     ready = request.app["startup_ready"].is_set()
     return web.json_response({
@@ -2093,8 +2572,8 @@ async def health_handler(request: web.Request):
         "mode": "webhook",
         "ready": ready,
     })
- 
- 
+
+
 async def on_startup(bot: Bot):
     if not RENDER_EXTERNAL_URL.startswith("https://"):
         raise RuntimeError("RENDER_EXTERNAL_URL is missing. Deploy as Render Web Service.")
@@ -2109,13 +2588,18 @@ async def on_startup(bot: Bot):
     log.info("Webhook pending updates: %s", info.pending_update_count)
     await bot.set_my_commands([
         BotCommand(command="start", description="Головне меню"),
+        BotCommand(command="help", description="Допомога"),
         BotCommand(command="restart", description="Перезапустити діалог"),
         BotCommand(command="cancel", description="Скасувати створення"),
         BotCommand(command="shop", description="Магазин ⭐"),
+        BotCommand(command="history", description="Мої презентації"),
+        BotCommand(command="support", description="Підтримка"),
+        BotCommand(command="paysupport", description="Проблеми з оплатою"),
+        BotCommand(command="clearchat", description="Очистити AI-діалог"),
         BotCommand(command="id", description="Мій Telegram ID"),
     ])
- 
- 
+
+
 @web.middleware
 async def startup_gate(request: web.Request, handler):
     # Telegram can keep sending updates to the existing webhook during a deploy.
@@ -2126,8 +2610,8 @@ async def startup_gate(request: web.Request, handler):
         except asyncio.TimeoutError:
             return web.Response(status=503, text="Prezent AI is starting")
     return await handler(request)
- 
- 
+
+
 async def schedule_backend_initialization(app: web.Application):
     async def initialize_backend():
         try:
@@ -2141,10 +2625,10 @@ async def schedule_backend_initialization(app: web.Application):
             raise
         except Exception:
             log.exception("Deferred Prezent AI initialization failed")
- 
+
     app["backend_startup_task"] = asyncio.create_task(initialize_backend())
- 
- 
+
+
 async def cancel_backend_initialization(app: web.Application):
     backup = app.get("backup_task")
     if backup and not backup.done():
@@ -2156,8 +2640,8 @@ async def cancel_backend_initialization(app: web.Application):
             await task
         except asyncio.CancelledError:
             pass
- 
- 
+
+
 def main():
     # Bind the public port first. Database initialization and Telegram API calls
     # are deliberately deferred so Render's port scanner can detect the service.
@@ -2185,7 +2669,7 @@ def main():
     if RENDER_IS_HOSTED and not DATABASE_URL:
         log.warning("SQLite on Render is ephemeral: purchased credits/PRO can be lost on restart. Admin backups in Telegram are enabled; for full safety set DATABASE_URL (Neon/PostgreSQL).")
     web.run_app(app, host="0.0.0.0", port=port, shutdown_timeout=30)
- 
- 
+
+
 if __name__ == "__main__":
     main()
